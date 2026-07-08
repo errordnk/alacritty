@@ -52,6 +52,15 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     event_proxy: U,
     drain_on_exit: bool,
     ref_test: bool,
+    /// An optional sink that gets a copy of every raw byte read from the
+    /// PTY, BEFORE it's parsed into `terminal` — added for callers that
+    /// need the actual bytes (not just "the grid changed" events), e.g. to
+    /// forward them to a separate process/client rather than only
+    /// tracking state locally. `None` by default; set via
+    /// `EventLoop::with_raw_byte_sink` after construction so existing
+    /// callers (`EventLoop::new`'s signature is unchanged) don't need any
+    /// changes.
+    raw_byte_sink: Option<Box<dyn Write + Send>>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -78,7 +87,17 @@ where
             event_proxy,
             drain_on_exit,
             ref_test,
+            raw_byte_sink: None,
         })
+    }
+
+    /// Registers `sink` to receive a copy of every raw byte this event
+    /// loop reads off the PTY, before it's parsed — see `raw_byte_sink`'s
+    /// doc comment. Must be called before `spawn()` (the sink is moved
+    /// into the spawned thread at that point).
+    pub fn with_raw_byte_sink(mut self, sink: Box<dyn Write + Send>) -> Self {
+        self.raw_byte_sink = Some(sink);
+        self
     }
 
     pub fn channel(&self) -> EventLoopSender {
@@ -148,6 +167,17 @@ where
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
                 writer.write_all(&buf[..unprocessed]).unwrap();
+            }
+
+            // Write a copy of the raw bytes to whoever registered via
+            // `with_raw_byte_sink` (e.g. forwarding them to a separate
+            // client process) — see `raw_byte_sink`'s doc comment. A
+            // write error here is intentionally swallowed rather than
+            // propagated: a disconnected forwarding sink shouldn't tear
+            // down this event loop, which still needs to keep parsing
+            // into `terminal` regardless.
+            if let Some(sink) = &mut self.raw_byte_sink {
+                let _ = sink.write_all(&buf[..unprocessed]);
             }
 
             // Parse the incoming bytes.
