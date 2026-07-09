@@ -157,7 +157,7 @@ where
                 Ok(got) => {
                     unprocessed += got;
                     if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
-                        log::warn!("DIAG raw got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
+                        eprintln!("DIAG raw got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
                     }
 
                     // Windows ConPTY reader workaround (see the dedup
@@ -304,7 +304,7 @@ where
                 self.recent_output.push_back((byte, now));
             }
             if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
-                log::warn!("DIAG after-dedup current={current:?} matched_prefix_len={matched_prefix_len}");
+                eprintln!("DIAG after-dedup current={current:?} matched_prefix_len={matched_prefix_len}");
             }
 
             // Write a copy of the bytes to the ref test file.
