@@ -174,8 +174,14 @@ where
                     // whole. Comparing THIS READ ALONE against the bytes
                     // immediately preceding it in `buf` catches that case
                     // directly, independent of the lock/lease timing.
+                    // At least 2 bytes, same reasoning as `MIN_DEDUP_MATCH`
+                    // further down — a 1-byte match is too easy to hit by
+                    // accident in ordinary repeated-byte output (spaces/
+                    // zeros in a table like `htop`'s), confirmed as a real
+                    // false positive that dropped and corrupted genuine
+                    // screen content.
                     let this_read = &buf[before_this_read..unprocessed];
-                    if before_this_read >= this_read.len() && !this_read.is_empty() {
+                    if this_read.len() >= 2 && before_this_read >= this_read.len() {
                         let preceding = &buf[before_this_read - this_read.len()..before_this_read];
                         if preceding == this_read {
                             unprocessed = before_this_read;
@@ -243,6 +249,18 @@ where
             // that whole window, not just of the one immediately prior
             // write.
             const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+            // Real repeats confirmed by direct reproduction are always the
+            // CR/LF pair a keystroke's echoed newline produces (`[13, 10]`,
+            // occasionally with a couple of trailing escape bytes fused
+            // on) — never a single byte. A 1-byte match is FAR too easy to
+            // hit by accident in ordinary output that just happens to
+            // repeat a byte (a run of spaces/zeros in a table like
+            // `htop`'s, confirmed as a real false-positive: dropped a
+            // genuine leading space/digit and visibly corrupted the
+            // screen). Requiring at least 2 matched bytes keeps the fix
+            // targeted at the actual bug shape without eating ordinary
+            // repeated bytes.
+            const MIN_DEDUP_MATCH: usize = 2;
             let now = Instant::now();
             while self.recent_output.front().is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_READ_WINDOW) {
                 self.recent_output.pop_front();
@@ -251,7 +269,7 @@ where
             let mut current = &buf[..unprocessed];
             let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
             let deduped;
-            if !current.is_empty() && recent.len() >= current.len() && recent.ends_with(current) {
+            if current.len() >= MIN_DEDUP_MATCH && recent.len() >= current.len() && recent.ends_with(current) {
                 // The whole chunk is an exact repeat of the tail of what
                 // was just forwarded — skip all three downstream
                 // consumers for it entirely.
@@ -269,7 +287,7 @@ where
             // whatever new bytes follow it.
             let max_prefix = current.len().min(recent.len());
             let mut matched_prefix_len = 0;
-            for len in (1..=max_prefix).rev() {
+            for len in (MIN_DEDUP_MATCH..=max_prefix).rev() {
                 if recent.ends_with(&current[..len]) {
                     matched_prefix_len = len;
                     break;
