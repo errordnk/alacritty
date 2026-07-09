@@ -148,7 +148,11 @@ where
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => {
                     unprocessed += got;
-                    eprintln!("DIAG pty_read got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
+                    eprintln!(
+                        "DIAG[{:?}] pty_read got={got} bytes={:?}",
+                        std::time::Instant::now(),
+                        &buf[before_this_read..unprocessed]
+                    );
 
                     // Windows ConPTY reader workaround (see the dedup
                     // check further down for the full writeup): this must
@@ -244,6 +248,7 @@ where
                 }
             }
             self.last_read_chunk = Some((current.to_vec(), now));
+            eprintln!("DIAG[{now:?}] AFTER-DEDUP current={:?}", current);
 
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
