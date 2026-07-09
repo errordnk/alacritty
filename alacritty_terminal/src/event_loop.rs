@@ -61,9 +61,17 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// callers (`EventLoop::new`'s signature is unchanged) don't need any
     /// changes.
     raw_byte_sink: Option<Box<dyn Write + Send>>,
-    /// The last chunk `pty_read` processed, plus when — see `pty_read`'s
-    /// deduplication check for why this exists.
-    last_read_chunk: Option<(Vec<u8>, Instant)>,
+    /// A rolling window of the most recent bytes `pty_read` has actually
+    /// forwarded downstream, each tagged with when it was read — see
+    /// `pty_read`'s deduplication check for why this exists. NOT just "the
+    /// last chunk": a genuine ConPTY-duplicated repeat can arrive after one
+    /// or more UNRELATED chunks land in between (e.g. a `\r\n` for Enter,
+    /// then a `\x1b[?6c` Device Attributes reply the shell prints before
+    /// its OWN duplicated `\r\n` arrives) — comparing only against the
+    /// single immediately-previous chunk misses that entirely, since by
+    /// the time the repeat shows up, "the last chunk" has already moved on
+    /// to the unrelated bytes in between.
+    recent_output: VecDeque<(u8, Instant)>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -91,7 +99,7 @@ where
             drain_on_exit,
             ref_test,
             raw_byte_sink: None,
-            last_read_chunk: None,
+            recent_output: VecDeque::new(),
         })
     }
 
@@ -148,11 +156,6 @@ where
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => {
                     unprocessed += got;
-                    eprintln!(
-                        "DIAG[{:?}] pty_read got={got} bytes={:?}",
-                        std::time::Instant::now(),
-                        &buf[before_this_read..unprocessed]
-                    );
 
                     // Windows ConPTY reader workaround (see the dedup
                     // check further down for the full writeup): this must
@@ -167,10 +170,10 @@ where
                     // `continue` path before ever reaching that check —
                     // fusing a genuine chunk and its ConPTY-duplicated
                     // repeat into ONE combined `buf[..unprocessed]` that no
-                    // longer matches the previous call's `last_read_chunk`
-                    // as a whole. Comparing THIS READ ALONE against the
-                    // bytes immediately preceding it in `buf` catches that
-                    // case directly, independent of the lock/lease timing.
+                    // longer matches a single remembered "last chunk" as a
+                    // whole. Comparing THIS READ ALONE against the bytes
+                    // immediately preceding it in `buf` catches that case
+                    // directly, independent of the lock/lease timing.
                     let this_read = &buf[before_this_read..unprocessed];
                     if before_this_read >= this_read.len() && !this_read.is_empty() {
                         let preceding = &buf[before_this_read - this_read.len()..before_this_read];
@@ -225,30 +228,60 @@ where
             // Unix's PTY reading has no equivalent synthetic-event path
             // and has never reproduced this, but the check is cheap
             // enough to leave unconditional rather than cfg-gating it.
-            let mut current = &buf[..unprocessed];
-            let now = Instant::now();
+            //
+            // NOT just "compare against the single previous chunk": a
+            // genuine ConPTY-duplicated repeat can arrive after one or
+            // more UNRELATED chunks land in between (confirmed via direct
+            // byte-level instrumentation — a `\r\n` for Enter, then the
+            // shell's own `\x1b[?6c` Device Attributes reply, THEN the
+            // duplicated `\r\n`). Comparing only against "the last chunk"
+            // misses this, since by the time the repeat shows up, that
+            // slot has already moved on to the unrelated bytes in
+            // between. Instead, `recent_output` keeps a rolling window of
+            // every byte actually forwarded downstream recently, and the
+            // check below looks for `current` as a repeated SUFFIX of
+            // that whole window, not just of the one immediately prior
+            // write.
             const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+            let now = Instant::now();
+            while self.recent_output.front().is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_READ_WINDOW) {
+                self.recent_output.pop_front();
+            }
+
+            let mut current = &buf[..unprocessed];
+            let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
             let deduped;
-            if let Some((last_chunk, last_at)) = &self.last_read_chunk {
-                let recent = now.duration_since(*last_at) < DUPLICATE_READ_WINDOW;
-                if recent && last_chunk.as_slice() == current {
-                    // The whole chunk is an exact repeat of the last one —
-                    // skip all three downstream consumers for it entirely.
-                    processed += unprocessed;
-                    unprocessed = 0;
-                    if processed >= MAX_LOCKED_READ {
-                        break;
-                    }
-                    continue;
+            if !current.is_empty() && recent.len() >= current.len() && recent.ends_with(current) {
+                // The whole chunk is an exact repeat of the tail of what
+                // was just forwarded — skip all three downstream
+                // consumers for it entirely.
+                processed += unprocessed;
+                unprocessed = 0;
+                if processed >= MAX_LOCKED_READ {
+                    break;
                 }
-                if recent && !last_chunk.is_empty() && current.len() > last_chunk.len() && current.starts_with(last_chunk.as_slice())
-                {
-                    deduped = current[last_chunk.len()..].to_vec();
-                    current = &deduped;
+                continue;
+            }
+            // Look for the longest prefix of `current` that repeats the
+            // tail of `recent_output` (longest first, so e.g. a 2-byte
+            // `\r\n` repeat is found even if a shorter accidental match
+            // exists at length 1) and strip just that much, forwarding
+            // whatever new bytes follow it.
+            let max_prefix = current.len().min(recent.len());
+            let mut matched_prefix_len = 0;
+            for len in (1..=max_prefix).rev() {
+                if recent.ends_with(&current[..len]) {
+                    matched_prefix_len = len;
+                    break;
                 }
             }
-            self.last_read_chunk = Some((current.to_vec(), now));
-            eprintln!("DIAG[{now:?}] AFTER-DEDUP current={:?}", current);
+            if matched_prefix_len > 0 {
+                deduped = current[matched_prefix_len..].to_vec();
+                current = &deduped;
+            }
+            for &byte in current {
+                self.recent_output.push_back((byte, now));
+            }
 
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
