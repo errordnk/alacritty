@@ -148,7 +148,7 @@ where
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => {
                     unprocessed += got;
-                    log::warn!("DIAG pty_read got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
+                    eprintln!("DIAG pty_read got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
 
                     // Windows ConPTY reader workaround (see the dedup
                     // check further down for the full writeup): this must
