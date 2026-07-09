@@ -61,6 +61,9 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// callers (`EventLoop::new`'s signature is unchanged) don't need any
     /// changes.
     raw_byte_sink: Option<Box<dyn Write + Send>>,
+    /// The last chunk `pty_read` processed, plus when — see `pty_read`'s
+    /// deduplication check for why this exists.
+    last_read_chunk: Option<(Vec<u8>, Instant)>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -88,6 +91,7 @@ where
             drain_on_exit,
             ref_test,
             raw_byte_sink: None,
+            last_read_chunk: None,
         })
     }
 
@@ -164,9 +168,56 @@ where
                 }),
             };
 
+            // Windows ConPTY reader workaround: `Pty::reregister` (called
+            // whenever write interest toggles, i.e. whenever a keystroke
+            // needs sending right after some output arrived) can
+            // re-trigger a synthetic "readable" event for the read side
+            // even when nothing new actually arrived, via
+            // `UnblockedReader::register`'s own "the pipe still has data"
+            // check. When that races with this loop not having fully
+            // drained the pipe yet, the SAME bytes get read here a second
+            // time — confirmed via direct byte-for-byte instrumentation
+            // downstream (Som's own terminal crate, github.com/errordnk/
+            // som) that a chunk this loop had already handed to `writer`/
+            // `raw_byte_sink`/`parser.advance` a moment earlier
+            // (single-digit milliseconds prior) sometimes arrives again,
+            // identical or as a repeated prefix fused onto genuinely new
+            // bytes. A `Pty::reregister` fix (not re-registering the read
+            // side on a write-only interest change) was attempted first
+            // but did not eliminate this in direct reproduction, so this
+            // dedup — applied once, here, before any of the three
+            // downstream consumers (ref-test writer, raw_byte_sink,
+            // parser) ever see the bytes — is the actual fix point.
+            // Unix's PTY reading has no equivalent synthetic-event path
+            // and has never reproduced this, but the check is cheap
+            // enough to leave unconditional rather than cfg-gating it.
+            let mut current = &buf[..unprocessed];
+            let now = Instant::now();
+            const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+            let deduped;
+            if let Some((last_chunk, last_at)) = &self.last_read_chunk {
+                let recent = now.duration_since(*last_at) < DUPLICATE_READ_WINDOW;
+                if recent && last_chunk.as_slice() == current {
+                    // The whole chunk is an exact repeat of the last one —
+                    // skip all three downstream consumers for it entirely.
+                    processed += unprocessed;
+                    unprocessed = 0;
+                    if processed >= MAX_LOCKED_READ {
+                        break;
+                    }
+                    continue;
+                }
+                if recent && !last_chunk.is_empty() && current.len() > last_chunk.len() && current.starts_with(last_chunk.as_slice())
+                {
+                    deduped = current[last_chunk.len()..].to_vec();
+                    current = &deduped;
+                }
+            }
+            self.last_read_chunk = Some((current.to_vec(), now));
+
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
-                writer.write_all(&buf[..unprocessed]).unwrap();
+                writer.write_all(current).unwrap();
             }
 
             // Write a copy of the raw bytes to whoever registered via
@@ -177,11 +228,11 @@ where
             // down this event loop, which still needs to keep parsing
             // into `terminal` regardless.
             if let Some(sink) = &mut self.raw_byte_sink {
-                let _ = sink.write_all(&buf[..unprocessed]);
+                let _ = sink.write_all(current);
             }
 
             // Parse the incoming bytes.
-            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            state.parser.advance(&mut **terminal, current);
 
             processed += unprocessed;
             unprocessed = 0;
