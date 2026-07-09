@@ -142,10 +142,39 @@ where
 
         loop {
             // Read from the PTY.
+            let before_this_read = unprocessed;
             match self.pty.reader().read(&mut buf[unprocessed..]) {
                 // This is received on Windows/macOS when no more data is readable from the PTY.
                 Ok(0) if unprocessed == 0 => break,
-                Ok(got) => unprocessed += got,
+                Ok(got) => {
+                    unprocessed += got;
+
+                    // Windows ConPTY reader workaround (see the dedup
+                    // check further down for the full writeup): this must
+                    // run on EVERY individual `read()` result, not just
+                    // once on the fully-accumulated `buf[..unprocessed]`
+                    // right before the parser. When the terminal lock
+                    // below is contended (e.g. the render thread holds it
+                    // while GPUI repaints, which is far more likely once
+                    // there's already a prompt/output on screen than on
+                    // the very first read of a session), this loop can run
+                    // several `read()`s back-to-back via the `None => `
+                    // `continue` path before ever reaching that check —
+                    // fusing a genuine chunk and its ConPTY-duplicated
+                    // repeat into ONE combined `buf[..unprocessed]` that no
+                    // longer matches the previous call's `last_read_chunk`
+                    // as a whole. Comparing THIS READ ALONE against the
+                    // bytes immediately preceding it in `buf` catches that
+                    // case directly, independent of the lock/lease timing.
+                    let this_read = &buf[before_this_read..unprocessed];
+                    if before_this_read >= this_read.len() && !this_read.is_empty() {
+                        let preceding = &buf[before_this_read - this_read.len()..before_this_read];
+                        if preceding == this_read {
+                            unprocessed = before_this_read;
+                            continue;
+                        }
+                    }
+                },
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted | ErrorKind::WouldBlock => {
                         // Go back to mio if we're caught up on parsing and the PTY would block.
