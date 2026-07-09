@@ -156,6 +156,7 @@ where
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => {
                     unprocessed += got;
+                    eprintln!("DIAG raw got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
 
                     // Windows ConPTY reader workaround (see the dedup
                     // check further down for the full writeup): this must
@@ -282,6 +283,7 @@ where
             for &byte in current {
                 self.recent_output.push_back((byte, now));
             }
+            eprintln!("DIAG after-dedup current={:?} matched_prefix_len={matched_prefix_len}", current);
 
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
