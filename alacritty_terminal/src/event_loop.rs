@@ -156,6 +156,9 @@ where
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => {
                     unprocessed += got;
+                    if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
+                        eprintln!("DIAG raw got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
+                    }
 
                     // Windows ConPTY reader workaround (see the dedup
                     // check further down for the full writeup): this must
@@ -299,6 +302,9 @@ where
             }
             for &byte in current {
                 self.recent_output.push_back((byte, now));
+            }
+            if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
+                eprintln!("DIAG after-dedup current={current:?} matched_prefix_len={matched_prefix_len}");
             }
 
             // Write a copy of the bytes to the ref test file.
