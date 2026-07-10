@@ -294,7 +294,21 @@ where
             let mut current = &buf[..unprocessed];
             let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
             let deduped;
-            if current.len() >= MIN_DEDUP_MATCH && recent.len() >= current.len() && recent.ends_with(current) {
+            // Excludes a bare `\r\n` (`[13, 10]`, no trailing escape bytes)
+            // from the whole-chunk-exact-match branch specifically — a
+            // genuine ConPTY duplicate is confirmed to always carry a few
+            // trailing escape bytes fused on (see the comment on
+            // `MIN_DEDUP_MATCH`), never JUST the bare CRLF pair on its own.
+            // A lone `\r\n` chunk matching the tail of `recent_output` is
+            // instead the ordinary, frequent, and completely legitimate
+            // case of a blank output line landing in its own `read()` right
+            // after a line that also happened to end `\r\n` (e.g. `cat`ing
+            // a file whose first line is blank right after another line) —
+            // confirmed as a real false positive that silently ate the
+            // blank line separating the kernel banner from the rest of a
+            // real `/etc/motd`.
+            let is_bare_crlf = current == [b'\r', b'\n'];
+            if !is_bare_crlf && current.len() >= MIN_DEDUP_MATCH && recent.len() >= current.len() && recent.ends_with(current) {
                 // The whole chunk is an exact repeat of the tail of what
                 // was just forwarded — skip all three downstream
                 // consumers for it entirely.
@@ -309,8 +323,13 @@ where
             // tail of `recent_output` (longest first, so e.g. a 2-byte
             // `\r\n` repeat is found even if a shorter accidental match
             // exists at length 1) and strip just that much, forwarding
-            // whatever new bytes follow it.
-            let max_prefix = current.len().min(recent.len());
+            // whatever new bytes follow it. Same `is_bare_crlf` exclusion
+            // as the whole-chunk branch above applies here too: without
+            // it, a `current` that IS just `\r\n` (max_prefix == 2 ==
+            // current.len()) would still have its entire 2 bytes stripped
+            // via this branch instead, silently eating the same
+            // legitimate blank line a different way.
+            let max_prefix = if is_bare_crlf { 0 } else { current.len().min(recent.len()) };
             let mut matched_prefix_len = 0;
             for len in (MIN_DEDUP_MATCH..=max_prefix).rev() {
                 if recent.ends_with(&current[..len]) {
