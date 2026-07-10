@@ -72,6 +72,20 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// the time the repeat shows up, "the last chunk" has already moved on
     /// to the unrelated bytes in between.
     recent_output: VecDeque<(u8, Instant)>,
+    /// When this read loop's `spawn()` last toggled write interest and
+    /// called `self.pty.reregister` — i.e. the one specific moment the
+    /// ConPTY duplicate-read bug (`UnblockedReader::register`'s "the pipe
+    /// still has data" check re-triggering a synthetic readable event even
+    /// when nothing new arrived) can actually happen. The dedup check in
+    /// `pty_read` below is gated on this being recent, INSTEAD OF matching
+    /// on the bytes' shape alone — matching on shape (e.g. "this chunk is
+    /// just `\r\n`") is fundamentally unreliable, since a real duplicate
+    /// and an entirely ordinary blank output line landing in its own
+    /// `read()` right after another `\r\n`-terminated line can look
+    /// byte-for-byte identical; the ONLY thing that actually distinguishes
+    /// a real duplicate is that it only happens right after a write-
+    /// interest toggle. `None` until the first toggle.
+    last_write_interest_toggle: Option<Instant>,
     /// When set, collapses a `\r\r\n` (CR CR LF) run read off the PTY back
     /// to a single `\r\n` before parsing — see `pty_read`'s dedicated
     /// handling for the full writeup. Set via `EventLoop::collapse_cr_cr_lf`
@@ -115,6 +129,7 @@ where
             ref_test,
             raw_byte_sink: None,
             recent_output: VecDeque::new(),
+            last_write_interest_toggle: None,
             collapse_cr_cr_lf: false,
             pending_trailing_cr: false,
         })
@@ -273,42 +288,49 @@ where
             // check below looks for `current` as a repeated SUFFIX of
             // that whole window, not just of the one immediately prior
             // write.
+            //
+            // ALSO gated on `last_write_interest_toggle` being recent (see
+            // its own doc comment) — matching on the bytes' shape alone
+            // used to be the only guard (requiring >= 2 matched bytes,
+            // since a real duplicate always carries a couple of trailing
+            // escape bytes beyond the bare `\r\n`), but that's fundamentally
+            // unreliable: a genuinely ordinary blank output line landing in
+            // its own `read()` right after another `\r\n`-terminated line
+            // is byte-for-byte indistinguishable from a real duplicate by
+            // shape alone — confirmed as a real false positive that ate
+            // the blank line between a MOTD's kernel banner and the rest
+            // of `/etc/motd`. The write-interest-toggle timing is the
+            // actual distinguishing fact: the bug this dedup exists for
+            // can ONLY happen right after a toggle (see the comment on
+            // `reregister` above), so gating on that recency instead of
+            // (or in addition to) the bytes' shape means ordinary output
+            // that isn't anywhere near a keystroke is never touched.
             const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
-            // Real repeats confirmed by direct reproduction are always the
-            // CR/LF pair a keystroke's echoed newline produces (`[13, 10]`,
-            // occasionally with a couple of trailing escape bytes fused
-            // on) — never a single byte. A 1-byte match is FAR too easy to
-            // hit by accident in ordinary output that just happens to
-            // repeat a byte (a run of spaces/zeros in a table like
-            // `htop`'s, confirmed as a real false-positive: dropped a
-            // genuine leading space/digit and visibly corrupted the
-            // screen). Requiring at least 2 matched bytes keeps the fix
-            // targeted at the actual bug shape without eating ordinary
-            // repeated bytes.
             const MIN_DEDUP_MATCH: usize = 2;
             let now = Instant::now();
             while self.recent_output.front().is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_READ_WINDOW) {
                 self.recent_output.pop_front();
             }
 
+            // Gated on a RECENT write-interest toggle (see
+            // `last_write_interest_toggle`'s doc comment for why this is
+            // the correct condition, not matching on the bytes' shape).
+            // Deliberately checked fresh on every chunk within this same
+            // `pty_read` call (not hoisted out of the loop) — a toggle can
+            // happen between reads inside one call too, though in practice
+            // it's set once just before `pty_read` runs.
+            let recently_toggled = self
+                .last_write_interest_toggle
+                .is_some_and(|at| now.duration_since(at) < DUPLICATE_READ_WINDOW);
+
             let mut current = &buf[..unprocessed];
             let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
             let deduped;
-            // Excludes a bare `\r\n` (`[13, 10]`, no trailing escape bytes)
-            // from the whole-chunk-exact-match branch specifically — a
-            // genuine ConPTY duplicate is confirmed to always carry a few
-            // trailing escape bytes fused on (see the comment on
-            // `MIN_DEDUP_MATCH`), never JUST the bare CRLF pair on its own.
-            // A lone `\r\n` chunk matching the tail of `recent_output` is
-            // instead the ordinary, frequent, and completely legitimate
-            // case of a blank output line landing in its own `read()` right
-            // after a line that also happened to end `\r\n` (e.g. `cat`ing
-            // a file whose first line is blank right after another line) —
-            // confirmed as a real false positive that silently ate the
-            // blank line separating the kernel banner from the rest of a
-            // real `/etc/motd`.
-            let is_bare_crlf = current == [b'\r', b'\n'];
-            if !is_bare_crlf && current.len() >= MIN_DEDUP_MATCH && recent.len() >= current.len() && recent.ends_with(current) {
+            if recently_toggled
+                && current.len() >= MIN_DEDUP_MATCH
+                && recent.len() >= current.len()
+                && recent.ends_with(current)
+            {
                 // The whole chunk is an exact repeat of the tail of what
                 // was just forwarded — skip all three downstream
                 // consumers for it entirely.
@@ -323,13 +345,9 @@ where
             // tail of `recent_output` (longest first, so e.g. a 2-byte
             // `\r\n` repeat is found even if a shorter accidental match
             // exists at length 1) and strip just that much, forwarding
-            // whatever new bytes follow it. Same `is_bare_crlf` exclusion
-            // as the whole-chunk branch above applies here too: without
-            // it, a `current` that IS just `\r\n` (max_prefix == 2 ==
-            // current.len()) would still have its entire 2 bytes stripped
-            // via this branch instead, silently eating the same
-            // legitimate blank line a different way.
-            let max_prefix = if is_bare_crlf { 0 } else { current.len().min(recent.len()) };
+            // whatever new bytes follow it. Same `recently_toggled` gate as
+            // the whole-chunk branch above applies here too.
+            let max_prefix = if recently_toggled { current.len().min(recent.len()) } else { 0 };
             let mut matched_prefix_len = 0;
             for len in (MIN_DEDUP_MATCH..=max_prefix).rev() {
                 if recent.ends_with(&current[..len]) {
@@ -541,8 +559,12 @@ where
                 if needs_write != interest.writable {
                     interest.writable = needs_write;
 
-                    // Re-register with new interest.
+                    // Re-register with new interest — this is the exact
+                    // moment that can spuriously re-trigger a readable
+                    // event for already-drained data (see
+                    // `last_write_interest_toggle`'s doc comment).
                     self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                    self.last_write_interest_toggle = Some(Instant::now());
                 }
             }
 
