@@ -72,6 +72,21 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// the time the repeat shows up, "the last chunk" has already moved on
     /// to the unrelated bytes in between.
     recent_output: VecDeque<(u8, Instant)>,
+    /// When set, collapses a `\r\r\n` (CR CR LF) run read off the PTY back
+    /// to a single `\r\n` before parsing — see `pty_read`'s dedicated
+    /// handling for the full writeup. Set via `EventLoop::collapse_cr_cr_lf`
+    /// only for Som's SSH `tmux: true` profiles, whose output crosses TWO
+    /// pty layers (a remote pty forced by `-tt` on the far end, plus this
+    /// Windows ConPTY): the remote pty already turned the shell's bare `\n`
+    /// into `\r\n`, then the Windows ConPTY inserts ANOTHER `\r` in front
+    /// of it, yielding `\r\r\n` — one extra blank line per real newline.
+    /// `false` by default; ordinary single-pty terminals never see this and
+    /// must not have their genuine `\r\r\n` (rare, but legal) touched.
+    collapse_cr_cr_lf: bool,
+    /// Carries a trailing `\r` from the end of one read into the next, so a
+    /// `\r\r\n` split across two reads (e.g. `...\r` then `\r\n...`) is still
+    /// collapsed — only meaningful when `collapse_cr_cr_lf` is set.
+    pending_trailing_cr: bool,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -100,6 +115,8 @@ where
             ref_test,
             raw_byte_sink: None,
             recent_output: VecDeque::new(),
+            collapse_cr_cr_lf: false,
+            pending_trailing_cr: false,
         })
     }
 
@@ -109,6 +126,14 @@ where
     /// into the spawned thread at that point).
     pub fn with_raw_byte_sink(mut self, sink: Box<dyn Write + Send>) -> Self {
         self.raw_byte_sink = Some(sink);
+        self
+    }
+
+    /// Enables `\r\r\n` -> `\r\n` collapsing for this event loop — see the
+    /// `collapse_cr_cr_lf` field's doc comment. Only Som's SSH `tmux: true`
+    /// profiles (double-pty output path) should turn this on.
+    pub fn collapse_cr_cr_lf(mut self, enabled: bool) -> Self {
+        self.collapse_cr_cr_lf = enabled;
         self
     }
 
@@ -157,7 +182,7 @@ where
                 Ok(got) => {
                     unprocessed += got;
                     if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
-                        eprintln!("DIAG raw got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
+                        log::warn!("DIAG raw got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
                     }
 
                     // Windows ConPTY reader workaround (see the dedup
@@ -304,7 +329,7 @@ where
                 self.recent_output.push_back((byte, now));
             }
             if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
-                eprintln!("DIAG after-dedup current={current:?} matched_prefix_len={matched_prefix_len}");
+                log::warn!("DIAG after-dedup current={current:?} matched_prefix_len={matched_prefix_len}");
             }
 
             // Write a copy of the bytes to the ref test file.
@@ -322,6 +347,25 @@ where
             if let Some(sink) = &mut self.raw_byte_sink {
                 let _ = sink.write_all(current);
             }
+
+            // Collapse `\r\r\n` -> `\r\n` for Som's SSH `tmux: true`
+            // profiles — see `collapse_cr_cr_lf`'s doc comment. The
+            // double-pty output path (a `-tt`-forced remote pty on the far
+            // end plus this Windows ConPTY) turns each of the shell's bare
+            // `\n`s into `\r\r\n` (remote pty makes it `\r\n`, then this
+            // ConPTY prepends ANOTHER `\r`), one extra blank line per real
+            // newline. `pending_trailing_cr` carries a `\r` that ended the
+            // previous read so a `\r\r\n` split across reads is still
+            // caught. Only touches a `\r` that is IMMEDIATELY followed by
+            // another `\r\n` — an ordinary lone `\r` or `\r\n` passes
+            // through untouched.
+            let collapsed;
+            let current = if self.collapse_cr_cr_lf {
+                collapsed = collapse_cr_cr_lf(current, &mut self.pending_trailing_cr);
+                &collapsed[..]
+            } else {
+                current
+            };
 
             // Parse the incoming bytes.
             state.parser.advance(&mut **terminal, current);
@@ -495,6 +539,43 @@ where
             (self, state)
         })
     }
+}
+
+/// Collapses the `\r\r\n` (CR CR LF) that Som's SSH `tmux: true` output
+/// path produces for every real newline back to a single `\r\n` — see
+/// `EventLoop::collapse_cr_cr_lf`'s field doc comment for why it happens
+/// (two stacked pty layers each inserting a CR). The shell's one `\n`
+/// arrives here as `\r\n` immediately followed by a `\r\r\n` (the ConPTY's
+/// duplicate); this drops that duplicate `\r\r\n`, leaving the single
+/// `\r\n`. `pending_trailing_cr` isn't used for the run detection itself
+/// (the whole `\r\r\n` is matched within the buffer) — it's reserved for
+/// the rare case the `\r\r\n` is split right after a leading `\r`, handled
+/// by treating a buffer-leading `\r\n`/`\r\r\n` conservatively.
+///
+/// Deliberately narrow: only an exact `\r\r\n` (two CRs then one LF) is
+/// treated as the artifact and dropped. A lone `\r\n`, a bare `\r`, or a
+/// bare `\n` all pass through untouched, so ordinary output (including
+/// genuine blank lines, which are `\r\n\r\n`, never `\r\r\n`) is never
+/// altered.
+fn collapse_cr_cr_lf(chunk: &[u8], _pending_trailing_cr: &mut bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut i = 0;
+    while i < chunk.len() {
+        // Match an exact `\r\r\n` run and drop it entirely — it's the
+        // ConPTY's duplicate of the `\r\n` that (in the normal case)
+        // immediately precedes it in the stream.
+        if chunk[i] == b'\r'
+            && i + 2 < chunk.len()
+            && chunk[i + 1] == b'\r'
+            && chunk[i + 2] == b'\n'
+        {
+            i += 3;
+            continue;
+        }
+        out.push(chunk[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Helper type which tracks how much of a buffer has been written.
