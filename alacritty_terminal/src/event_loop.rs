@@ -319,9 +319,24 @@ where
             // `pty_read` call (not hoisted out of the loop) — a toggle can
             // happen between reads inside one call too, though in practice
             // it's set once just before `pty_read` runs.
+            //
+            // ALSO gated on `cfg(windows)` — this whole dedup exists for a
+            // Windows ConPTY-specific synthetic-event bug (see `reregister`
+            // above); Unix's PTY reading has no equivalent path and has
+            // never reproduced it. Confirmed this matters in practice, not
+            // just in theory: an SSH tmux:true profile's HOLDER runs this
+            // SAME event loop on the Unix (Linux) side, reading the real
+            // shell's actual PTY directly — with the dedup active there
+            // too, its very first `pty_read` (the shell's MOTD, several
+            // back-to-back reads while the terminal lock briefly contended)
+            // ate the legitimate blank line between the kernel banner and
+            // the rest of `/etc/motd`, which a real `ssh` login never does.
+            #[cfg(windows)]
             let recently_toggled = self
                 .last_write_interest_toggle
                 .is_some_and(|at| now.duration_since(at) < DUPLICATE_READ_WINDOW);
+            #[cfg(not(windows))]
+            let recently_toggled = false;
 
             let mut current = &buf[..unprocessed];
             let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
