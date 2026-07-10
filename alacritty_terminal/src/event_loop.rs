@@ -181,9 +181,6 @@ where
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => {
                     unprocessed += got;
-                    if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
-                        log::warn!("DIAG raw got={got} bytes={:?}", &buf[before_this_read..unprocessed]);
-                    }
 
                     // Windows ConPTY reader workaround (see the dedup
                     // check further down for the full writeup): this must
@@ -327,9 +324,6 @@ where
             }
             for &byte in current {
                 self.recent_output.push_back((byte, now));
-            }
-            if std::env::var("SOM_DIAG_PTY_READ").is_ok() {
-                log::warn!("DIAG after-dedup current={current:?} matched_prefix_len={matched_prefix_len}");
             }
 
             // Write a copy of the bytes to the ref test file.
@@ -736,5 +730,49 @@ impl<T> PeekableReceiver<T> {
                 res => res.ok(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod collapse_cr_cr_lf_tests {
+    use super::collapse_cr_cr_lf;
+
+    #[test]
+    fn drops_an_exact_cr_cr_lf_run() {
+        let mut pending = false;
+        // The real artifact: a leading `\r\n` (from the shell echo) then
+        // the ConPTY's duplicate `\r\r\n`, then the rest of the stream.
+        let out = collapse_cr_cr_lf(b"\r\n\r\r\n\x1b[?2004l", &mut pending);
+        assert_eq!(out, b"\r\n\x1b[?2004l");
+    }
+
+    #[test]
+    fn leaves_a_plain_cr_lf_untouched() {
+        let mut pending = false;
+        let out = collapse_cr_cr_lf(b"hello\r\nworld", &mut pending);
+        assert_eq!(out, b"hello\r\nworld");
+    }
+
+    #[test]
+    fn leaves_a_genuine_blank_line_cr_lf_cr_lf_untouched() {
+        // A real blank line is `\r\n\r\n`, never `\r\r\n` — must survive.
+        let mut pending = false;
+        let out = collapse_cr_cr_lf(b"a\r\n\r\nb", &mut pending);
+        assert_eq!(out, b"a\r\n\r\nb");
+    }
+
+    #[test]
+    fn leaves_a_bare_cr_and_bare_lf_untouched() {
+        let mut pending = false;
+        assert_eq!(collapse_cr_cr_lf(b"\r", &mut pending), b"\r");
+        assert_eq!(collapse_cr_cr_lf(b"\n", &mut pending), b"\n");
+        assert_eq!(collapse_cr_cr_lf(b"a\rb", &mut pending), b"a\rb");
+    }
+
+    #[test]
+    fn collapses_several_cr_cr_lf_runs_in_one_chunk() {
+        let mut pending = false;
+        let out = collapse_cr_cr_lf(b"\r\n\r\r\nx\r\n\r\r\ny", &mut pending);
+        assert_eq!(out, b"\r\nx\r\ny");
     }
 }
