@@ -83,7 +83,26 @@ impl EventedReadWrite for Pty {
         poll_opts: polling::PollMode,
     ) -> io::Result<()> {
         self.conin.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
-        self.conout.register(poll, with_key(interest, PTY_READ_WRITE_TOKEN), poll_opts);
+        // Deliberately NOT re-registering `conout` (the read side) here —
+        // `reregister` only ever runs because `event_loop.rs`'s main loop
+        // toggles WRITE interest (`needs_write != interest.writable`);
+        // read interest is always on and never needs re-registering. Doing
+        // it anyway re-triggered `UnblockedReader::register`'s own "send a
+        // synthetic readable event if the pipe still has data" check (see
+        // that method's doc comment) EVERY time the write side toggled —
+        // if the read-side pipe hadn't been fully drained by the time a
+        // write happened (a common race: the shell prints a prompt, then
+        // the event loop reregisters right after because a keystroke needs
+        // sending), that synthetic event caused `pty_read` to run AGAIN
+        // over bytes that were already read and forwarded, duplicating
+        // them. Confirmed as the root cause of a real, repeatedly
+        // reproduced bug (doubled `\r\n` between every remote shell
+        // prompt over an SSH tmux profile) by direct instrumentation: the
+        // exact same 2-byte `[13, 10]` chunk was observed being written to
+        // `EventLoop::with_raw_byte_sink`'s sink TWICE in immediate
+        // succession, only on the Windows ConPTY side, only once real
+        // keystrokes started flowing (never on the very first, read-only
+        // snapshot).
         self.child_watcher.register(poll, with_key(interest, PTY_CHILD_EVENT_TOKEN));
 
         Ok(())

@@ -52,6 +52,55 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     event_proxy: U,
     drain_on_exit: bool,
     ref_test: bool,
+    /// An optional sink that gets a copy of every raw byte read from the
+    /// PTY, BEFORE it's parsed into `terminal` — added for callers that
+    /// need the actual bytes (not just "the grid changed" events), e.g. to
+    /// forward them to a separate process/client rather than only
+    /// tracking state locally. `None` by default; set via
+    /// `EventLoop::with_raw_byte_sink` after construction so existing
+    /// callers (`EventLoop::new`'s signature is unchanged) don't need any
+    /// changes.
+    raw_byte_sink: Option<Box<dyn Write + Send>>,
+    /// A rolling window of the most recent bytes `pty_read` has actually
+    /// forwarded downstream, each tagged with when it was read — see
+    /// `pty_read`'s deduplication check for why this exists. NOT just "the
+    /// last chunk": a genuine ConPTY-duplicated repeat can arrive after one
+    /// or more UNRELATED chunks land in between (e.g. a `\r\n` for Enter,
+    /// then a `\x1b[?6c` Device Attributes reply the shell prints before
+    /// its OWN duplicated `\r\n` arrives) — comparing only against the
+    /// single immediately-previous chunk misses that entirely, since by
+    /// the time the repeat shows up, "the last chunk" has already moved on
+    /// to the unrelated bytes in between.
+    recent_output: VecDeque<(u8, Instant)>,
+    /// When this read loop's `spawn()` last toggled write interest and
+    /// called `self.pty.reregister` — i.e. the one specific moment the
+    /// ConPTY duplicate-read bug (`UnblockedReader::register`'s "the pipe
+    /// still has data" check re-triggering a synthetic readable event even
+    /// when nothing new arrived) can actually happen. The dedup check in
+    /// `pty_read` below is gated on this being recent, INSTEAD OF matching
+    /// on the bytes' shape alone — matching on shape (e.g. "this chunk is
+    /// just `\r\n`") is fundamentally unreliable, since a real duplicate
+    /// and an entirely ordinary blank output line landing in its own
+    /// `read()` right after another `\r\n`-terminated line can look
+    /// byte-for-byte identical; the ONLY thing that actually distinguishes
+    /// a real duplicate is that it only happens right after a write-
+    /// interest toggle. `None` until the first toggle.
+    last_write_interest_toggle: Option<Instant>,
+    /// When set, collapses a `\r\r\n` (CR CR LF) run read off the PTY back
+    /// to a single `\r\n` before parsing — see `pty_read`'s dedicated
+    /// handling for the full writeup. Set via `EventLoop::collapse_cr_cr_lf`
+    /// only for Som's SSH `tmux: true` profiles, whose output crosses TWO
+    /// pty layers (a remote pty forced by `-tt` on the far end, plus this
+    /// Windows ConPTY): the remote pty already turned the shell's bare `\n`
+    /// into `\r\n`, then the Windows ConPTY inserts ANOTHER `\r` in front
+    /// of it, yielding `\r\r\n` — one extra blank line per real newline.
+    /// `false` by default; ordinary single-pty terminals never see this and
+    /// must not have their genuine `\r\r\n` (rare, but legal) touched.
+    collapse_cr_cr_lf: bool,
+    /// Carries a trailing `\r` from the end of one read into the next, so a
+    /// `\r\r\n` split across two reads (e.g. `...\r` then `\r\n...`) is still
+    /// collapsed — only meaningful when `collapse_cr_cr_lf` is set.
+    pending_trailing_cr: bool,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -78,7 +127,29 @@ where
             event_proxy,
             drain_on_exit,
             ref_test,
+            raw_byte_sink: None,
+            recent_output: VecDeque::new(),
+            last_write_interest_toggle: None,
+            collapse_cr_cr_lf: false,
+            pending_trailing_cr: false,
         })
+    }
+
+    /// Registers `sink` to receive a copy of every raw byte this event
+    /// loop reads off the PTY, before it's parsed — see `raw_byte_sink`'s
+    /// doc comment. Must be called before `spawn()` (the sink is moved
+    /// into the spawned thread at that point).
+    pub fn with_raw_byte_sink(mut self, sink: Box<dyn Write + Send>) -> Self {
+        self.raw_byte_sink = Some(sink);
+        self
+    }
+
+    /// Enables `\r\r\n` -> `\r\n` collapsing for this event loop — see the
+    /// `collapse_cr_cr_lf` field's doc comment. Only Som's SSH `tmux: true`
+    /// profiles (double-pty output path) should turn this on.
+    pub fn collapse_cr_cr_lf(mut self, enabled: bool) -> Self {
+        self.collapse_cr_cr_lf = enabled;
+        self
     }
 
     pub fn channel(&self) -> EventLoopSender {
@@ -119,10 +190,45 @@ where
 
         loop {
             // Read from the PTY.
+            let before_this_read = unprocessed;
             match self.pty.reader().read(&mut buf[unprocessed..]) {
                 // This is received on Windows/macOS when no more data is readable from the PTY.
                 Ok(0) if unprocessed == 0 => break,
-                Ok(got) => unprocessed += got,
+                Ok(got) => {
+                    unprocessed += got;
+
+                    // Windows ConPTY reader workaround (see the dedup
+                    // check further down for the full writeup): this must
+                    // run on EVERY individual `read()` result, not just
+                    // once on the fully-accumulated `buf[..unprocessed]`
+                    // right before the parser. When the terminal lock
+                    // below is contended (e.g. the render thread holds it
+                    // while GPUI repaints, which is far more likely once
+                    // there's already a prompt/output on screen than on
+                    // the very first read of a session), this loop can run
+                    // several `read()`s back-to-back via the `None => `
+                    // `continue` path before ever reaching that check —
+                    // fusing a genuine chunk and its ConPTY-duplicated
+                    // repeat into ONE combined `buf[..unprocessed]` that no
+                    // longer matches a single remembered "last chunk" as a
+                    // whole. Comparing THIS READ ALONE against the bytes
+                    // immediately preceding it in `buf` catches that case
+                    // directly, independent of the lock/lease timing.
+                    // At least 2 bytes, same reasoning as `MIN_DEDUP_MATCH`
+                    // further down — a 1-byte match is too easy to hit by
+                    // accident in ordinary repeated-byte output (spaces/
+                    // zeros in a table like `htop`'s), confirmed as a real
+                    // false positive that dropped and corrupted genuine
+                    // screen content.
+                    let this_read = &buf[before_this_read..unprocessed];
+                    if this_read.len() >= 2 && before_this_read >= this_read.len() {
+                        let preceding = &buf[before_this_read - this_read.len()..before_this_read];
+                        if preceding == this_read {
+                            unprocessed = before_this_read;
+                            continue;
+                        }
+                    }
+                },
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted | ErrorKind::WouldBlock => {
                         // Go back to mio if we're caught up on parsing and the PTY would block.
@@ -145,13 +251,170 @@ where
                 }),
             };
 
-            // Write a copy of the bytes to the ref test file.
-            if let Some(writer) = &mut writer {
-                writer.write_all(&buf[..unprocessed]).unwrap();
+            // Windows ConPTY reader workaround: `Pty::reregister` (called
+            // whenever write interest toggles, i.e. whenever a keystroke
+            // needs sending right after some output arrived) can
+            // re-trigger a synthetic "readable" event for the read side
+            // even when nothing new actually arrived, via
+            // `UnblockedReader::register`'s own "the pipe still has data"
+            // check. When that races with this loop not having fully
+            // drained the pipe yet, the SAME bytes get read here a second
+            // time — confirmed via direct byte-for-byte instrumentation
+            // downstream (Som's own terminal crate, github.com/errordnk/
+            // som) that a chunk this loop had already handed to `writer`/
+            // `raw_byte_sink`/`parser.advance` a moment earlier
+            // (single-digit milliseconds prior) sometimes arrives again,
+            // identical or as a repeated prefix fused onto genuinely new
+            // bytes. A `Pty::reregister` fix (not re-registering the read
+            // side on a write-only interest change) was attempted first
+            // but did not eliminate this in direct reproduction, so this
+            // dedup — applied once, here, before any of the three
+            // downstream consumers (ref-test writer, raw_byte_sink,
+            // parser) ever see the bytes — is the actual fix point.
+            // Unix's PTY reading has no equivalent synthetic-event path
+            // and has never reproduced this, but the check is cheap
+            // enough to leave unconditional rather than cfg-gating it.
+            //
+            // NOT just "compare against the single previous chunk": a
+            // genuine ConPTY-duplicated repeat can arrive after one or
+            // more UNRELATED chunks land in between (confirmed via direct
+            // byte-level instrumentation — a `\r\n` for Enter, then the
+            // shell's own `\x1b[?6c` Device Attributes reply, THEN the
+            // duplicated `\r\n`). Comparing only against "the last chunk"
+            // misses this, since by the time the repeat shows up, that
+            // slot has already moved on to the unrelated bytes in
+            // between. Instead, `recent_output` keeps a rolling window of
+            // every byte actually forwarded downstream recently, and the
+            // check below looks for `current` as a repeated SUFFIX of
+            // that whole window, not just of the one immediately prior
+            // write.
+            //
+            // ALSO gated on `last_write_interest_toggle` being recent (see
+            // its own doc comment) — matching on the bytes' shape alone
+            // used to be the only guard (requiring >= 2 matched bytes,
+            // since a real duplicate always carries a couple of trailing
+            // escape bytes beyond the bare `\r\n`), but that's fundamentally
+            // unreliable: a genuinely ordinary blank output line landing in
+            // its own `read()` right after another `\r\n`-terminated line
+            // is byte-for-byte indistinguishable from a real duplicate by
+            // shape alone — confirmed as a real false positive that ate
+            // the blank line between a MOTD's kernel banner and the rest
+            // of `/etc/motd`. The write-interest-toggle timing is the
+            // actual distinguishing fact: the bug this dedup exists for
+            // can ONLY happen right after a toggle (see the comment on
+            // `reregister` above), so gating on that recency instead of
+            // (or in addition to) the bytes' shape means ordinary output
+            // that isn't anywhere near a keystroke is never touched.
+            const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+            const MIN_DEDUP_MATCH: usize = 2;
+            let now = Instant::now();
+            while self.recent_output.front().is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_READ_WINDOW) {
+                self.recent_output.pop_front();
             }
 
+            // Gated on a RECENT write-interest toggle (see
+            // `last_write_interest_toggle`'s doc comment for why this is
+            // the correct condition, not matching on the bytes' shape).
+            // Deliberately checked fresh on every chunk within this same
+            // `pty_read` call (not hoisted out of the loop) — a toggle can
+            // happen between reads inside one call too, though in practice
+            // it's set once just before `pty_read` runs.
+            //
+            // ALSO gated on `cfg(windows)` — this whole dedup exists for a
+            // Windows ConPTY-specific synthetic-event bug (see `reregister`
+            // above); Unix's PTY reading has no equivalent path and has
+            // never reproduced it. Confirmed this matters in practice, not
+            // just in theory: an SSH tmux:true profile's HOLDER runs this
+            // SAME event loop on the Unix (Linux) side, reading the real
+            // shell's actual PTY directly — with the dedup active there
+            // too, its very first `pty_read` (the shell's MOTD, several
+            // back-to-back reads while the terminal lock briefly contended)
+            // ate the legitimate blank line between the kernel banner and
+            // the rest of `/etc/motd`, which a real `ssh` login never does.
+            #[cfg(windows)]
+            let recently_toggled = self
+                .last_write_interest_toggle
+                .is_some_and(|at| now.duration_since(at) < DUPLICATE_READ_WINDOW);
+            #[cfg(not(windows))]
+            let recently_toggled = false;
+
+            let mut current = &buf[..unprocessed];
+            let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
+            let deduped;
+            if recently_toggled
+                && current.len() >= MIN_DEDUP_MATCH
+                && recent.len() >= current.len()
+                && recent.ends_with(current)
+            {
+                // The whole chunk is an exact repeat of the tail of what
+                // was just forwarded — skip all three downstream
+                // consumers for it entirely.
+                processed += unprocessed;
+                unprocessed = 0;
+                if processed >= MAX_LOCKED_READ {
+                    break;
+                }
+                continue;
+            }
+            // Look for the longest prefix of `current` that repeats the
+            // tail of `recent_output` (longest first, so e.g. a 2-byte
+            // `\r\n` repeat is found even if a shorter accidental match
+            // exists at length 1) and strip just that much, forwarding
+            // whatever new bytes follow it. Same `recently_toggled` gate as
+            // the whole-chunk branch above applies here too.
+            let max_prefix = if recently_toggled { current.len().min(recent.len()) } else { 0 };
+            let mut matched_prefix_len = 0;
+            for len in (MIN_DEDUP_MATCH..=max_prefix).rev() {
+                if recent.ends_with(&current[..len]) {
+                    matched_prefix_len = len;
+                    break;
+                }
+            }
+            if matched_prefix_len > 0 {
+                deduped = current[matched_prefix_len..].to_vec();
+                current = &deduped;
+            }
+            for &byte in current {
+                self.recent_output.push_back((byte, now));
+            }
+
+            // Write a copy of the bytes to the ref test file.
+            if let Some(writer) = &mut writer {
+                writer.write_all(current).unwrap();
+            }
+
+            // Write a copy of the raw bytes to whoever registered via
+            // `with_raw_byte_sink` (e.g. forwarding them to a separate
+            // client process) — see `raw_byte_sink`'s doc comment. A
+            // write error here is intentionally swallowed rather than
+            // propagated: a disconnected forwarding sink shouldn't tear
+            // down this event loop, which still needs to keep parsing
+            // into `terminal` regardless.
+            if let Some(sink) = &mut self.raw_byte_sink {
+                let _ = sink.write_all(current);
+            }
+
+            // Collapse `\r\r\n` -> `\r\n` for Som's SSH `tmux: true`
+            // profiles — see `collapse_cr_cr_lf`'s doc comment. The
+            // double-pty output path (a `-tt`-forced remote pty on the far
+            // end plus this Windows ConPTY) turns each of the shell's bare
+            // `\n`s into `\r\r\n` (remote pty makes it `\r\n`, then this
+            // ConPTY prepends ANOTHER `\r`), one extra blank line per real
+            // newline. `pending_trailing_cr` carries a `\r` that ended the
+            // previous read so a `\r\r\n` split across reads is still
+            // caught. Only touches a `\r` that is IMMEDIATELY followed by
+            // another `\r\n` — an ordinary lone `\r` or `\r\n` passes
+            // through untouched.
+            let collapsed;
+            let current = if self.collapse_cr_cr_lf {
+                collapsed = collapse_cr_cr_lf(current, &mut self.pending_trailing_cr);
+                &collapsed[..]
+            } else {
+                current
+            };
+
             // Parse the incoming bytes.
-            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            state.parser.advance(&mut **terminal, current);
 
             processed += unprocessed;
             unprocessed = 0;
@@ -311,8 +574,12 @@ where
                 if needs_write != interest.writable {
                     interest.writable = needs_write;
 
-                    // Re-register with new interest.
+                    // Re-register with new interest — this is the exact
+                    // moment that can spuriously re-trigger a readable
+                    // event for already-drained data (see
+                    // `last_write_interest_toggle`'s doc comment).
                     self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
+                    self.last_write_interest_toggle = Some(Instant::now());
                 }
             }
 
@@ -322,6 +589,43 @@ where
             (self, state)
         })
     }
+}
+
+/// Collapses the `\r\r\n` (CR CR LF) that Som's SSH `tmux: true` output
+/// path produces for every real newline back to a single `\r\n` — see
+/// `EventLoop::collapse_cr_cr_lf`'s field doc comment for why it happens
+/// (two stacked pty layers each inserting a CR). The shell's one `\n`
+/// arrives here as `\r\n` immediately followed by a `\r\r\n` (the ConPTY's
+/// duplicate); this drops that duplicate `\r\r\n`, leaving the single
+/// `\r\n`. `pending_trailing_cr` isn't used for the run detection itself
+/// (the whole `\r\r\n` is matched within the buffer) — it's reserved for
+/// the rare case the `\r\r\n` is split right after a leading `\r`, handled
+/// by treating a buffer-leading `\r\n`/`\r\r\n` conservatively.
+///
+/// Deliberately narrow: only an exact `\r\r\n` (two CRs then one LF) is
+/// treated as the artifact and dropped. A lone `\r\n`, a bare `\r`, or a
+/// bare `\n` all pass through untouched, so ordinary output (including
+/// genuine blank lines, which are `\r\n\r\n`, never `\r\r\n`) is never
+/// altered.
+fn collapse_cr_cr_lf(chunk: &[u8], _pending_trailing_cr: &mut bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut i = 0;
+    while i < chunk.len() {
+        // Match an exact `\r\r\n` run and drop it entirely — it's the
+        // ConPTY's duplicate of the `\r\n` that (in the normal case)
+        // immediately precedes it in the stream.
+        if chunk[i] == b'\r'
+            && i + 2 < chunk.len()
+            && chunk[i + 1] == b'\r'
+            && chunk[i + 2] == b'\n'
+        {
+            i += 3;
+            continue;
+        }
+        out.push(chunk[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Helper type which tracks how much of a buffer has been written.
@@ -482,5 +786,49 @@ impl<T> PeekableReceiver<T> {
                 res => res.ok(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod collapse_cr_cr_lf_tests {
+    use super::collapse_cr_cr_lf;
+
+    #[test]
+    fn drops_an_exact_cr_cr_lf_run() {
+        let mut pending = false;
+        // The real artifact: a leading `\r\n` (from the shell echo) then
+        // the ConPTY's duplicate `\r\r\n`, then the rest of the stream.
+        let out = collapse_cr_cr_lf(b"\r\n\r\r\n\x1b[?2004l", &mut pending);
+        assert_eq!(out, b"\r\n\x1b[?2004l");
+    }
+
+    #[test]
+    fn leaves_a_plain_cr_lf_untouched() {
+        let mut pending = false;
+        let out = collapse_cr_cr_lf(b"hello\r\nworld", &mut pending);
+        assert_eq!(out, b"hello\r\nworld");
+    }
+
+    #[test]
+    fn leaves_a_genuine_blank_line_cr_lf_cr_lf_untouched() {
+        // A real blank line is `\r\n\r\n`, never `\r\r\n` — must survive.
+        let mut pending = false;
+        let out = collapse_cr_cr_lf(b"a\r\n\r\nb", &mut pending);
+        assert_eq!(out, b"a\r\n\r\nb");
+    }
+
+    #[test]
+    fn leaves_a_bare_cr_and_bare_lf_untouched() {
+        let mut pending = false;
+        assert_eq!(collapse_cr_cr_lf(b"\r", &mut pending), b"\r");
+        assert_eq!(collapse_cr_cr_lf(b"\n", &mut pending), b"\n");
+        assert_eq!(collapse_cr_cr_lf(b"a\rb", &mut pending), b"a\rb");
+    }
+
+    #[test]
+    fn collapses_several_cr_cr_lf_runs_in_one_chunk() {
+        let mut pending = false;
+        let out = collapse_cr_cr_lf(b"\r\n\r\r\nx\r\n\r\r\ny", &mut pending);
+        assert_eq!(out, b"\r\nx\r\ny");
     }
 }
