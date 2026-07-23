@@ -2321,10 +2321,11 @@ impl<T: EventListener> Handler for Term<T> {
 
     /// An Application Program Command string has begun.
     ///
-    /// Just accumulate raw bytes into `apc_buffer` until `apc_unhook` — the
-    /// actual protocol (currently: Kitty's terminal graphics protocol,
-    /// <https://sw.kovidgoyal.net/kitty/graphics-protocol/>) is parsed out
-    /// of the complete buffer there, not incrementally here.
+    /// Just accumulate raw bytes into `apc_buffer` until `apc_unhook` — this
+    /// crate stays protocol-agnostic about what APC content means (see
+    /// `Event::ApcString`'s doc comment); interpreting it (currently: Kitty's
+    /// terminal graphics protocol, <https://sw.kovidgoyal.net/kitty/graphics-protocol/>)
+    /// is the receiving application's job, not this one's.
     #[inline]
     fn apc_hook(&mut self) {
         self.apc_buffer.clear();
@@ -2336,16 +2337,13 @@ impl<T: EventListener> Handler for Term<T> {
         self.apc_buffer.push(byte);
     }
 
-    /// The Application Program Command string has ended — `apc_buffer` now
-    /// holds its complete raw content.
+    /// The Application Program Command string has ended — hand the complete
+    /// raw content off via `Event::ApcString` and reset `apc_buffer` so a
+    /// subsequent string starts clean.
     #[inline]
     fn apc_unhook(&mut self) {
-        // Protocol parsing (Kitty graphics: key=value,...;base64 payload)
-        // lands here in a later change — for now, just log so a
-        // Kitty-graphics-emitting program's APC output is visibly observed
-        // rather than as silently as it was before this Handler existed at
-        // all.
-        trace!("APC string received ({} bytes), not yet interpreted", self.apc_buffer.len());
+        let bytes = mem::take(&mut self.apc_buffer);
+        self.event_proxy.send_event(Event::ApcString(bytes));
     }
 }
 
@@ -2597,9 +2595,21 @@ mod tests {
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
 
     #[test]
-    fn apc_string_accumulates_and_resets() {
+    fn apc_string_accumulates_and_dispatches() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct RecordingListener(Rc<RefCell<Vec<Event>>>);
+        impl EventListener for RecordingListener {
+            fn send_event(&self, event: Event) {
+                self.0.borrow_mut().push(event);
+            }
+        }
+
         let size = TermSize::new(5, 10);
-        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Term::new(Config::default(), &size, RecordingListener(events.clone()));
 
         // A representative Kitty graphics protocol APC payload.
         term.apc_hook();
@@ -2607,16 +2617,27 @@ mod tests {
             term.apc_put(*byte);
         }
         assert_eq!(term.apc_buffer, b"Ga=T,f=100;AAA=");
-        term.apc_unhook();
-        // apc_unhook doesn't clear the buffer itself (parsing consumes it in
-        // a later change) — but the NEXT apc_hook must, so an aborted or
-        // back-to-back string can't leak previous content into the next.
-        assert_eq!(term.apc_buffer, b"Ga=T,f=100;AAA=");
 
+        term.apc_unhook();
+        // apc_unhook must both clear apc_buffer (so a subsequent apc_hook
+        // starts clean without depending on apc_hook's own clear() as the
+        // only safety net) and dispatch the complete content via Event::ApcString.
+        assert!(term.apc_buffer.is_empty());
+        assert_eq!(events.borrow().len(), 1);
+        match &events.borrow()[0] {
+            Event::ApcString(bytes) => assert_eq!(bytes, b"Ga=T,f=100;AAA="),
+            other => panic!("expected Event::ApcString, got {other:?}"),
+        }
+
+        // A second string must not see leftover content from the first.
         term.apc_hook();
         assert!(term.apc_buffer.is_empty());
         term.apc_put(b'x');
-        assert_eq!(term.apc_buffer, b"x");
+        term.apc_unhook();
+        match &events.borrow()[1] {
+            Event::ApcString(bytes) => assert_eq!(bytes, b"x"),
+            other => panic!("expected Event::ApcString, got {other:?}"),
+        }
     }
 
     #[test]

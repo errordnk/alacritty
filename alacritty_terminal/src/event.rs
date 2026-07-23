@@ -56,6 +56,17 @@ pub enum Event {
 
     /// Child process exited.
     ChildExit(ExitStatus),
+
+    /// A complete Application Program Command string has been received.
+    ///
+    /// This crate deliberately stays protocol-agnostic about APC content —
+    /// it doesn't know or care that Kitty's terminal graphics protocol
+    /// (<https://sw.kovidgoyal.net/kitty/graphics-protocol/>) is the
+    /// motivating consumer. `bytes` is the complete raw APC string content
+    /// (everything between `apc_hook` and `apc_unhook`, i.e. `Term::apc_buffer`
+    /// at the moment the string ended) — parsing it into anything meaningful
+    /// is entirely the receiving application's job.
+    ApcString(Vec<u8>),
 }
 
 impl Debug for Event {
@@ -74,6 +85,7 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
+            Event::ApcString(bytes) => write!(f, "ApcString({} bytes)", bytes.len()),
         }
     }
 }
