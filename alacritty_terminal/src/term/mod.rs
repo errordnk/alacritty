@@ -327,6 +327,19 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Raw bytes accumulated for the Application Program Command string
+    /// currently being received (between `apc_hook` and `apc_unhook`).
+    ///
+    /// Kitty's terminal graphics protocol
+    /// (<https://sw.kovidgoyal.net/kitty/graphics-protocol/>) is the
+    /// motivating use of APC — its own `key=value,...;payload` encoding is
+    /// parsed out of this buffer once `apc_unhook` fires, not here. Cleared
+    /// on `apc_hook` (defensively, in case a previous string was aborted
+    /// mid-stream without a matching `apc_unhook` — e.g. by CAN/SUB, which
+    /// `Handler` has no separate callback for and so can't clear this
+    /// itself).
+    apc_buffer: Vec<u8>,
 }
 
 /// Configuration options for the [`Term`].
@@ -441,6 +454,7 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            apc_buffer: Default::default(),
         }
     }
 
@@ -2269,6 +2283,35 @@ impl<T: EventListener> Handler for Term<T> {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
+
+    /// An Application Program Command string has begun.
+    ///
+    /// Just accumulate raw bytes into `apc_buffer` until `apc_unhook` — the
+    /// actual protocol (currently: Kitty's terminal graphics protocol,
+    /// <https://sw.kovidgoyal.net/kitty/graphics-protocol/>) is parsed out
+    /// of the complete buffer there, not incrementally here.
+    #[inline]
+    fn apc_hook(&mut self) {
+        self.apc_buffer.clear();
+    }
+
+    /// A single byte of the in-progress Application Program Command string.
+    #[inline]
+    fn apc_put(&mut self, byte: u8) {
+        self.apc_buffer.push(byte);
+    }
+
+    /// The Application Program Command string has ended — `apc_buffer` now
+    /// holds its complete raw content.
+    #[inline]
+    fn apc_unhook(&mut self) {
+        // Protocol parsing (Kitty graphics: key=value,...;base64 payload)
+        // lands here in a later change — for now, just log so a
+        // Kitty-graphics-emitting program's APC output is visibly observed
+        // rather than as silently as it was before this Handler existed at
+        // all.
+        trace!("APC string received ({} bytes), not yet interpreted", self.apc_buffer.len());
+    }
 }
 
 /// The state of the [`Mode`] and [`PrivateMode`].
@@ -2517,6 +2560,29 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn apc_string_accumulates_and_resets() {
+        let size = TermSize::new(5, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // A representative Kitty graphics protocol APC payload.
+        term.apc_hook();
+        for byte in b"Ga=T,f=100;AAA=" {
+            term.apc_put(*byte);
+        }
+        assert_eq!(term.apc_buffer, b"Ga=T,f=100;AAA=");
+        term.apc_unhook();
+        // apc_unhook doesn't clear the buffer itself (parsing consumes it in
+        // a later change) — but the NEXT apc_hook must, so an aborted or
+        // back-to-back string can't leak previous content into the next.
+        assert_eq!(term.apc_buffer, b"Ga=T,f=100;AAA=");
+
+        term.apc_hook();
+        assert!(term.apc_buffer.is_empty());
+        term.apc_put(b'x');
+        assert_eq!(term.apc_buffer, b"x");
+    }
 
     #[test]
     fn scroll_display_page_up() {
