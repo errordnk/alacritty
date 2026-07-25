@@ -3,6 +3,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::index::Point;
 use crate::term::ClipboardType;
 use crate::vte::ansi::Rgb;
 
@@ -66,7 +67,21 @@ pub enum Event {
     /// (everything between `apc_hook` and `apc_unhook`, i.e. `Term::apc_buffer`
     /// at the moment the string ended) — parsing it into anything meaningful
     /// is entirely the receiving application's job.
-    ApcString(Vec<u8>),
+    ///
+    /// `cursor` is the grid cursor position AT THE MOMENT the APC string
+    /// ended (captured in `apc_unhook`, synchronously during VTE parsing) —
+    /// not whatever position the cursor happens to be at whenever the
+    /// receiving application gets around to processing this event off its
+    /// own queue. This distinction matters: a receiving application that
+    /// batches/queues events (as Som's `Terminal::event_loop_task` does,
+    /// draining `events_rx` on a timer rather than per-event) can easily
+    /// process several events well after more terminal output has already
+    /// moved the cursor further — re-reading `Term::grid().cursor.point` at
+    /// that later point would silently attribute a stale APC command (e.g.
+    /// Kitty's cursor-relative `a=p` placement) to the WRONG position. This
+    /// field exists specifically so a consumer never needs to (and never
+    /// should) re-derive the cursor position for an ApcString event itself.
+    ApcString(Vec<u8>, Point),
 }
 
 impl Debug for Event {
@@ -85,7 +100,9 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
-            Event::ApcString(bytes) => write!(f, "ApcString({} bytes)", bytes.len()),
+            Event::ApcString(bytes, cursor) => {
+                write!(f, "ApcString({} bytes, cursor={cursor:?})", bytes.len())
+            },
         }
     }
 }

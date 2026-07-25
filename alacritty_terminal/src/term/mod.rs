@@ -2340,10 +2340,15 @@ impl<T: EventListener> Handler for Term<T> {
     /// The Application Program Command string has ended — hand the complete
     /// raw content off via `Event::ApcString` and reset `apc_buffer` so a
     /// subsequent string starts clean.
+    ///
+    /// The cursor position is captured HERE, synchronously, rather than
+    /// left for the event's eventual consumer to re-read later — see
+    /// `Event::ApcString`'s doc comment for why that distinction matters.
     #[inline]
     fn apc_unhook(&mut self) {
         let bytes = mem::take(&mut self.apc_buffer);
-        self.event_proxy.send_event(Event::ApcString(bytes));
+        let cursor = self.grid.cursor.point;
+        self.event_proxy.send_event(Event::ApcString(bytes, cursor));
     }
 }
 
@@ -2625,7 +2630,7 @@ mod tests {
         assert!(term.apc_buffer.is_empty());
         assert_eq!(events.borrow().len(), 1);
         match &events.borrow()[0] {
-            Event::ApcString(bytes) => assert_eq!(bytes, b"Ga=T,f=100;AAA="),
+            Event::ApcString(bytes, _cursor) => assert_eq!(bytes, b"Ga=T,f=100;AAA="),
             other => panic!("expected Event::ApcString, got {other:?}"),
         }
 
@@ -2635,7 +2640,52 @@ mod tests {
         term.apc_put(b'x');
         term.apc_unhook();
         match &events.borrow()[1] {
-            Event::ApcString(bytes) => assert_eq!(bytes, b"x"),
+            Event::ApcString(bytes, _cursor) => assert_eq!(bytes, b"x"),
+            other => panic!("expected Event::ApcString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apc_unhook_captures_the_cursor_position_at_that_exact_moment() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct RecordingListener(Rc<RefCell<Vec<Event>>>);
+        impl EventListener for RecordingListener {
+            fn send_event(&self, event: Event) {
+                self.0.borrow_mut().push(event);
+            }
+        }
+
+        let size = TermSize::new(10, 20);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Term::new(Config::default(), &size, RecordingListener(events.clone()));
+
+        // Move the cursor to a known, non-origin position first.
+        for _ in 0..3 {
+            term.linefeed();
+        }
+        term.grid.cursor.point.column = crate::index::Column(4);
+        let cursor_at_apc_time = term.grid.cursor.point;
+
+        term.apc_hook();
+        term.apc_put(b'x');
+        term.apc_unhook();
+
+        // Move the cursor again AFTER apc_unhook — this must not affect the
+        // cursor position already captured in the dispatched event, proving
+        // the snapshot is taken at apc_unhook time, not read lazily later.
+        for _ in 0..5 {
+            term.linefeed();
+        }
+
+        match &events.borrow()[0] {
+            Event::ApcString(_bytes, cursor) => assert_eq!(
+                *cursor, cursor_at_apc_time,
+                "the cursor captured in the event must match the position AT apc_unhook time, \
+                 not wherever the cursor ended up afterward"
+            ),
             other => panic!("expected Event::ApcString, got {other:?}"),
         }
     }
