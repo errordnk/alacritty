@@ -2313,6 +2313,24 @@ impl<T: EventListener> Handler for Term<T> {
         })));
     }
 
+    /// `CSI 16 t` — report one cell's size in pixels as `CSI 6 ; height ;
+    /// width t`.
+    ///
+    /// Answered through the same `TextAreaSizeRequest` plumbing as `CSI 14
+    /// t` (the embedding application is the only thing that knows the real
+    /// pixel metrics), just reporting `cell_height`/`cell_width` rather
+    /// than the whole grid's extent. Clients that draw images need this to
+    /// convert between an image's pixel dimensions and the cell rectangle
+    /// they ask the terminal to place it in; left unanswered, they fall
+    /// back to a hardcoded guess and the rectangle they pick no longer
+    /// matches the image's aspect ratio.
+    #[inline]
+    fn cell_size_pixels(&mut self) {
+        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
+        })));
+    }
+
     #[inline]
     fn text_area_size_chars(&mut self) {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
