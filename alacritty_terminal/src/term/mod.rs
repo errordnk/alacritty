@@ -2618,6 +2618,48 @@ mod tests {
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
 
     #[test]
+    fn csi_16_t_reports_the_cell_size_in_pixels() {
+        use crate::event::WindowSize;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct RecordingListener(Rc<RefCell<Vec<Event>>>);
+        impl EventListener for RecordingListener {
+            fn send_event(&self, event: Event) {
+                self.0.borrow_mut().push(event);
+            }
+        }
+
+        let size = TermSize::new(10, 20);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Term::new(Config::default(), &size, RecordingListener(events.clone()));
+
+        let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
+        parser.advance(&mut term, b"\x1b[16t");
+
+        let borrowed = events.borrow();
+        let formatter = borrowed
+            .iter()
+            .find_map(|event| match event {
+                Event::TextAreaSizeRequest(formatter) => Some(formatter.clone()),
+                _ => None,
+            })
+            .expect("CSI 16 t must request the window size so it can be answered");
+
+        // Answer shape per XTerm's window-ops: `CSI 6 ; height ; width t`,
+        // reporting ONE CELL's pixel size (not the whole text area, which
+        // is what `CSI 14 t` reports as `CSI 4 ; h ; w t`).
+        let reply = formatter(WindowSize {
+            num_lines: 20,
+            num_cols: 10,
+            cell_height: 34,
+            cell_width: 17,
+        });
+        assert_eq!(reply, "\x1b[6;34;17t");
+    }
+
+    #[test]
     fn apc_string_accumulates_and_dispatches() {
         use std::cell::RefCell;
         use std::rc::Rc;
