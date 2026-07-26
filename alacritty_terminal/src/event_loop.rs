@@ -307,6 +307,18 @@ where
             // that isn't anywhere near a keystroke is never touched.
             const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
             const MIN_DEDUP_MATCH: usize = 2;
+            // The duplicated-read bug this dedup exists for only ever
+            // duplicates the handful of bytes a keystroke echoes back, so
+            // there's no reason to inspect anything bigger — and a real
+            // reason not to. Bulk output (an image transmission's base64,
+            // most of all: `yazi` pushes megabytes of it the instant a
+            // keypress moves the selection, landing squarely inside the
+            // post-toggle window) contains long genuinely-repeating runs,
+            // which this matcher happily mistakes for a duplicated read and
+            // deletes. Losing an arbitrary slice out of the middle of an
+            // APC string truncates the image transmission: the terminal
+            // then waits forever for a final chunk that already went by.
+            const MAX_DEDUP_CHUNK: usize = 256;
             let now = Instant::now();
             while self.recent_output.front().is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_READ_WINDOW) {
                 self.recent_output.pop_front();
@@ -337,6 +349,11 @@ where
                 .is_some_and(|at| now.duration_since(at) < DUPLICATE_READ_WINDOW);
             #[cfg(not(windows))]
             let recently_toggled = false;
+
+            // See `MAX_DEDUP_CHUNK`: only keystroke-sized reads can be the
+            // duplicate this exists to catch, and running the matcher over
+            // bulk output actively corrupts it.
+            let recently_toggled = recently_toggled && unprocessed <= MAX_DEDUP_CHUNK;
 
             let mut current = &buf[..unprocessed];
             let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
