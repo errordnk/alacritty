@@ -28,6 +28,24 @@ use crate::tty::windows::{Pty, cmdline, win32_string};
 
 const PIPE_CAPACITY: usize = crate::event_loop::READ_BUFFER_SIZE;
 
+/// Size of `UnblockedReader`'s own in-process `piper` buffer for `conout`
+/// specifically (NOT the OS-level pipe, NOT `conin`'s write-side buffer —
+/// see `UnblockedReader::new`'s reader-thread doc comment). Deliberately
+/// much smaller than `PIPE_CAPACITY`: `piper::fill_inner`'s read loop does
+/// not return — and so does not wake the outer `pty_read`/`poll.wait`
+/// consumer — until this buffer fills up or the underlying blocking
+/// `ReadFile` stalls waiting for the next byte. Confirmed via direct
+/// instrumentation (a real animated GIF sent over Kitty's graphics
+/// protocol) that with a 1MB buffer here, a single `poll_fill` call
+/// legitimately took 5+ seconds to return — the sender was writing in
+/// bursts with brief pauses between `print!` calls, and `ReadFile` blocked
+/// through every one of those pauses waiting for the buffer to fill
+/// further, before ever handing control back. A much smaller buffer forces
+/// `fill_inner` to return (and wake the consumer) far more often, at the
+/// cost of slightly more read-loop overhead — an easy trade for output
+/// this size and burstiness.
+const CONOUT_READER_BUFFER_CAPACITY: usize = 64 * 1024;
+
 /// Load the pseudoconsole API from conpty.dll if possible, otherwise use the
 /// standard Windows API.
 ///
@@ -111,24 +129,24 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let api = ConptyApi::new();
     let mut pty_handle: HPCON = 0;
 
-    // The raw OS anonymous pipe ConPTY itself writes into/reads from —
-    // NOT to be confused with `PIPE_CAPACITY`/`UnblockedReader`'s own
-    // in-process `piper` buffer further downstream, which only comes into
-    // play AFTER bytes have already made it out of this pipe. Explicitly
-    // sized to `PIPE_CAPACITY` (was `0`, i.e. "let the OS pick a
-    // default" — `CreatePipe`'s documented behavior for a 0 size hint is
-    // a small default, typically a few KB) after a real animated-GIF
-    // Kitty graphics transmission (dozens of megabytes of base64 arriving
-    // continuously, far faster and more sustained than any interactive
-    // shell output) reproducibly stalled forever partway through: the
-    // reader thread would read a burst of data and then simply never see
-    // another readable byte again, even though the child process kept
-    // writing successfully the whole time. A too-small OS-level pipe
-    // between ConPTY and this process is the most direct explanation for
-    // sustained high-volume output specifically triggering a stall that
-    // ordinary interactive terminal output never does.
-    let (conout, conout_pty_handle) = miow::pipe::anonymous(PIPE_CAPACITY as u32)?;
-    let (conin_pty_handle, conin) = miow::pipe::anonymous(PIPE_CAPACITY as u32)?;
+    // Passing 0 as the size parameter allows the "system default" buffer
+    // size to be used. There may be small performance and memory advantages
+    // to be gained by tuning this in the future, but it's likely a reasonable
+    // start point.
+    //
+    // A larger explicit size (previously tried: PIPE_CAPACITY, 1MB) makes
+    // things WORSE, not better, for a real animated-GIF Kitty graphics
+    // transmission — see UnblockedReader::new's own reader-thread doc
+    // comment for why: the actual bottleneck is `piper::fill_inner`'s loop
+    // not returning (and so not waking the outer `pty_read`/`poll.wait`
+    // consumer) until ITS OWN internal buffer — sized by the
+    // `pipe_capacity` argument to `UnblockedReader::new`, i.e.
+    // `PIPE_CAPACITY` below, not this OS-level pipe — fills up or the
+    // blocking `ReadFile` underneath it stalls waiting for the next byte.
+    // A larger OS-level pipe just lets more bytes pile up before that
+    // inner loop notices, making the stall longer, not shorter.
+    let (conout, conout_pty_handle) = miow::pipe::anonymous(0)?;
+    let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 
     // Create the Pseudo Console, using the pipes.
     let result = unsafe {
@@ -247,7 +265,7 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     }
 
     let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
-    let conout = UnblockedReader::new(conout, PIPE_CAPACITY);
+    let conout = UnblockedReader::new(conout, CONOUT_READER_BUFFER_CAPACITY);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
     let conpty = Conpty { handle: pty_handle as HPCON, api };

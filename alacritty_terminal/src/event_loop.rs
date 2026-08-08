@@ -606,6 +606,41 @@ where
                     break;
                 }
 
+                // Windows ConPTY workaround: proactively try a read even
+                // when `poll.wait` reported zero events, instead of relying
+                // solely on `PTY_READ_WRITE_TOKEN` showing up in `events`.
+                // `conout`'s completion packet is posted by a `Waker`
+                // registered deep inside `UnblockedReader::try_read` (via
+                // `piper`'s own internal reader-waker plumbing, itself
+                // driven by a THIRD, separate OS thread continuously
+                // draining the real ConPTY handle) — three independent
+                // async layers between "bytes are sitting in the buffer"
+                // and "poll.wait actually returns a readable event for
+                // them". Confirmed via direct instrumentation (a real
+                // animated GIF's sustained Kitty graphics APC burst) that
+                // this can go permanently silent: `piper`'s reader-side
+                // buffer fills, its background thread parks waiting to be
+                // woken by the NEXT `try_read` call — but that next call
+                // never happens, because `poll.wait` never posts the event
+                // that would trigger it, because nothing is producing that
+                // event either. A genuine lost-wakeup between async layers,
+                // not merely a slow one. Since `MAX_POLL_WAIT` above
+                // already guarantees this loop iterates at least every
+                // 50ms regardless, spending one of those idle iterations on
+                // a real `pty_read` call directly breaks that cycle: it
+                // re-invokes `try_read`, which re-registers a fresh waker
+                // AND drains whatever already-buffered bytes are sitting
+                // there — cheap when there's truly nothing to read (a
+                // single non-blocking check), and the only thing that
+                // actually recovers a silently-stuck read side otherwise.
+                #[cfg(windows)]
+                if events.is_empty() {
+                    if let Err(err) = self.pty_read(&mut state, &mut buf, pipe.as_mut()) {
+                        error!("Error reading from PTY in event loop: {err}");
+                        break 'event_loop;
+                    }
+                }
+
                 for event in events.iter() {
                     match event.key {
                         tty::PTY_CHILD_EVENT_TOKEN => {
