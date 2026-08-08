@@ -541,11 +541,50 @@ where
             'event_loop: loop {
                 // Wakeup the event loop when a synchronized update timeout was reached.
                 let handler = state.parser.sync_timeout();
-                let timeout =
+                let sync_timeout =
                     handler.sync_timeout().map(|st| st.saturating_duration_since(Instant::now()));
 
+                // Windows ConPTY workaround: never block `poll.wait`
+                // indefinitely (no sync-timeout in flight -> `sync_timeout`
+                // is `None` -> would otherwise wait forever). `conout`'s
+                // read side is registered exactly ONCE at startup and
+                // never re-registered on write-interest toggles (see
+                // `Pty::reregister`'s own doc comment for why) — its
+                // wakeups instead flow through `UnblockedReader`'s internal
+                // `piper` pipe waker, posted from a completely separate OS
+                // thread that continuously drains the real ConPTY handle.
+                // Confirmed via direct instrumentation (headless benchmark
+                // transmitting a real animated GIF, dozens of Kitty
+                // graphics APC chunks arriving faster and more
+                // continuously than any interactive shell output ever
+                // would) that under a sustained fast write burst, this
+                // waker's completion packet can go missing entirely: reads
+                // stop advancing mid-transmission and `poll.wait` then
+                // blocks for the remainder of the test's timeout with
+                // ZERO events, even though the child process kept writing
+                // successfully the whole time (confirmed via the writer's
+                // own per-write logging). A capped wait bounds the damage
+                // of any single missed wakeup to this interval — the next
+                // iteration's own `try_read` call re-registers a fresh
+                // waker regardless of whether `poll.wait` returned because
+                // of a real event or just the cap expiring, so a missed
+                // notification costs at most one extra `poll.wait` cycle
+                // instead of stalling the whole session. Kept strictly
+                // separate from `sync_timeout` itself (NOT folded into the
+                // same `Option`) — the "handle synchronized update
+                // timeout" branch right below must only fire on a REAL
+                // sync timeout elapsing, not on this cap's own expiry,
+                // or every idle period would spuriously call `stop_sync`
+                // and emit a `Wakeup` every `MAX_POLL_WAIT`.
+                #[cfg(windows)]
+                const MAX_POLL_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+                #[cfg(windows)]
+                let wait_timeout = Some(sync_timeout.map_or(MAX_POLL_WAIT, |t| t.min(MAX_POLL_WAIT)));
+                #[cfg(not(windows))]
+                let wait_timeout = sync_timeout;
+
                 events.clear();
-                if let Err(err) = self.poll.wait(&mut events, timeout) {
+                if let Err(err) = self.poll.wait(&mut events, wait_timeout) {
                     match err.kind() {
                         ErrorKind::Interrupted => continue,
                         _ => {
@@ -556,7 +595,7 @@ where
                 }
 
                 // Handle synchronized update timeout.
-                if events.is_empty() && self.rx.peek().is_none() {
+                if events.is_empty() && self.rx.peek().is_none() && sync_timeout.is_some() {
                     state.parser.stop_sync(&mut *self.terminal.lock());
                     self.event_proxy.send_event(Event::Wakeup);
                     continue;
