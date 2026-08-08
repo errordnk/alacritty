@@ -203,14 +203,7 @@ where
         loop {
             // Read from the PTY.
             let before_this_read = unprocessed;
-            let read_result = self.pty.reader().read(&mut buf[unprocessed..]);
-            if std::env::var_os("SOM_DIAG_PTYREAD").is_some() {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("C:\\home\\dnk\\som\\alacritty_diag.log") {
-                    let _ = writeln!(f, "[{:?}] pty_read: read() -> {:?} (before_this_read={before_this_read})", std::time::Instant::now(), read_result.as_ref().map(|n| *n));
-                }
-            }
-            match read_result {
+            match self.pty.reader().read(&mut buf[unprocessed..]) {
                 // This is received on Windows/macOS when no more data is readable from the PTY.
                 Ok(0) if unprocessed == 0 => break,
                 Ok(got) => {
@@ -598,12 +591,6 @@ where
                             error!("Event loop polling error: {err}");
                             break 'event_loop;
                         },
-                    }
-                }
-                if std::env::var_os("SOM_DIAG_PTYREAD").is_some() {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("C:\\home\\dnk\\som\\alacritty_diag.log") {
-                        let _ = writeln!(f, "[{:?}] event_loop: poll.wait(timeout={wait_timeout:?}) returned {} events", std::time::Instant::now(), events.len());
                     }
                 }
 
