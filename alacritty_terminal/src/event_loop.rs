@@ -26,6 +26,18 @@ pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;
 /// Max bytes to read from the PTY while the terminal is locked.
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
+/// Max size a chunk can be and still be considered for the ConPTY
+/// duplicate-read workarounds below (both the per-`read()` immediate-repeat
+/// check and the rolling-window check). The duplicated-read bug these exist
+/// for only ever duplicates the handful of bytes a keystroke echoes back —
+/// there's no reason to inspect anything bigger, and a real reason not to:
+/// bulk output (an image transmission's base64, most of all) contains long
+/// genuinely-repeating runs, which this style of matcher happily mistakes
+/// for a duplicated read and deletes. Losing an arbitrary slice out of the
+/// middle of an APC string truncates the image transmission: the terminal
+/// then waits forever for a final chunk that already went by.
+const MAX_DEDUP_CHUNK: usize = 256;
+
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
 pub enum Msg {
@@ -220,8 +232,34 @@ where
                     // zeros in a table like `htop`'s), confirmed as a real
                     // false positive that dropped and corrupted genuine
                     // screen content.
+                    //
+                    // ALSO gated on `cfg(windows)` (this bug is ConPTY-
+                    // specific, same reasoning as the rolling-window check's
+                    // own `cfg(windows)` gate below) and on `MAX_DEDUP_CHUNK`
+                    // (same reasoning as that check's own cap): a large
+                    // single `read()` off the PTY is exactly the shape of a
+                    // Kitty graphics APC chunk (`somcat`/`yazi` write up to
+                    // 4096 base64 bytes at once), and base64-encoded/
+                    // PNG-compressed image data routinely contains
+                    // genuinely-repeating equal-length runs purely by
+                    // chance — this check used to have neither guard, so it
+                    // silently ate a same-length repeated run out of the
+                    // middle of a real animation frame's payload roughly
+                    // 1-in-N transmissions (confirmed via `somcat`'s own
+                    // per-chunk logging: the sender's `send_chunked` loop
+                    // completed and flushed every chunk, but the receiving
+                    // `ImageStore` never saw enough bytes to finish decoding
+                    // that frame — bytes went missing strictly between the
+                    // PTY write and the parser, not in either endpoint).
                     let this_read = &buf[before_this_read..unprocessed];
-                    if this_read.len() >= 2 && before_this_read >= this_read.len() {
+                    #[cfg(windows)]
+                    let this_read_dedup_eligible = this_read.len() <= MAX_DEDUP_CHUNK;
+                    #[cfg(not(windows))]
+                    let this_read_dedup_eligible = false;
+                    if this_read_dedup_eligible
+                        && this_read.len() >= 2
+                        && before_this_read >= this_read.len()
+                    {
                         let preceding = &buf[before_this_read - this_read.len()..before_this_read];
                         if preceding == this_read {
                             unprocessed = before_this_read;
@@ -307,18 +345,14 @@ where
             // that isn't anywhere near a keystroke is never touched.
             const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
             const MIN_DEDUP_MATCH: usize = 2;
-            // The duplicated-read bug this dedup exists for only ever
-            // duplicates the handful of bytes a keystroke echoes back, so
-            // there's no reason to inspect anything bigger — and a real
-            // reason not to. Bulk output (an image transmission's base64,
-            // most of all: `yazi` pushes megabytes of it the instant a
-            // keypress moves the selection, landing squarely inside the
-            // post-toggle window) contains long genuinely-repeating runs,
-            // which this matcher happily mistakes for a duplicated read and
-            // deletes. Losing an arbitrary slice out of the middle of an
-            // APC string truncates the image transmission: the terminal
-            // then waits forever for a final chunk that already went by.
-            const MAX_DEDUP_CHUNK: usize = 256;
+            // See the module-level `MAX_DEDUP_CHUNK` doc comment: `yazi`
+            // pushes megabytes of base64 the instant a keypress moves the
+            // selection, landing squarely inside the post-toggle window,
+            // and this matcher would otherwise happily mistake its long
+            // genuinely-repeating runs for a duplicated read and delete
+            // them — losing an arbitrary slice out of the middle of an APC
+            // string truncates the image transmission: the terminal then
+            // waits forever for a final chunk that already went by.
             let now = Instant::now();
             while self.recent_output.front().is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_READ_WINDOW) {
                 self.recent_output.pop_front();
