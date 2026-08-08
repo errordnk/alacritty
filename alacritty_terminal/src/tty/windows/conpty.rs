@@ -111,12 +111,24 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
     let api = ConptyApi::new();
     let mut pty_handle: HPCON = 0;
 
-    // Passing 0 as the size parameter allows the "system default" buffer
-    // size to be used. There may be small performance and memory advantages
-    // to be gained by tuning this in the future, but it's likely a reasonable
-    // start point.
-    let (conout, conout_pty_handle) = miow::pipe::anonymous(0)?;
-    let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
+    // The raw OS anonymous pipe ConPTY itself writes into/reads from —
+    // NOT to be confused with `PIPE_CAPACITY`/`UnblockedReader`'s own
+    // in-process `piper` buffer further downstream, which only comes into
+    // play AFTER bytes have already made it out of this pipe. Explicitly
+    // sized to `PIPE_CAPACITY` (was `0`, i.e. "let the OS pick a
+    // default" — `CreatePipe`'s documented behavior for a 0 size hint is
+    // a small default, typically a few KB) after a real animated-GIF
+    // Kitty graphics transmission (dozens of megabytes of base64 arriving
+    // continuously, far faster and more sustained than any interactive
+    // shell output) reproducibly stalled forever partway through: the
+    // reader thread would read a burst of data and then simply never see
+    // another readable byte again, even though the child process kept
+    // writing successfully the whole time. A too-small OS-level pipe
+    // between ConPTY and this process is the most direct explanation for
+    // sustained high-volume output specifically triggering a stall that
+    // ordinary interactive terminal output never does.
+    let (conout, conout_pty_handle) = miow::pipe::anonymous(PIPE_CAPACITY as u32)?;
+    let (conin_pty_handle, conin) = miow::pipe::anonymous(PIPE_CAPACITY as u32)?;
 
     // Create the Pseudo Console, using the pipes.
     let result = unsafe {
