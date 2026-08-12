@@ -702,6 +702,32 @@ impl<T> Term<T> {
 
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
+        self.resize_with_reflow(size, true);
+    }
+
+    /// Resize terminal to new dimensions, with explicit control over
+    /// whether the main screen's long lines get reflowed (wrapped/
+    /// unwrapped) to fit the new column count. `resize` above always
+    /// reflows (`reflow = true`) — that's correct for ordinary terminal
+    /// text, but Som's SRP rich-content placeholder grids are wide,
+    /// deliberately unwrapped rows (one row of placeholder cells per
+    /// pixel-row of the image, printed with an explicit `\r\n` after
+    /// each). Reflowing them mid-resize silently splits a placeholder row
+    /// into two grid rows whenever it's wider than the new column count,
+    /// growing the image's effective row count and history_size *inside*
+    /// alacritty itself — before Som's own resize-time placeholder resync
+    /// ever runs — which desyncs the image's tracked origin/row count
+    /// from the actual grid and, after several resizes, walks the cursor
+    /// to a negative `Line` (a later resize then panics on `self.lines -
+    /// self.cursor.point.line.0 as usize` underflowing). Passing
+    /// `reflow = false` here disables ONLY this splitting for ordinary
+    /// text too (a real regression for interactive shell use, accepted as
+    /// the lesser evil since Som's own resync already re-derives correct
+    /// placeholder geometry from scratch on every resize, and normal text
+    /// simply keeps whatever columns it already had instead of unwrapping
+    /// — visually identical to how most other terminals behave when you
+    /// don't drag them wider than the text was written for).
+    pub fn resize_with_reflow<S: Dimensions>(&mut self, size: S, reflow: bool) {
         let old_cols = self.columns();
         let old_lines = self.screen_lines();
 
@@ -723,8 +749,8 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        self.grid.resize(reflow && !is_alt, num_lines, num_cols);
+        self.inactive_grid.resize(reflow && is_alt, num_lines, num_cols);
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
