@@ -1889,6 +1889,16 @@ impl<T: EventListener> Handler for Term<T> {
             ansi::ClearMode::Saved => (),
         }
 
+        // Only `All` (`CSI 2 J`, what a shell's real `clear`/`Clear-Host`
+        // actually sends) wipes the whole visible screen for good — the
+        // signal a receiving application needs to tell "content is truly
+        // gone" apart from a partial clear (`Above`/`Below`) or the
+        // scrollback-only `Saved`, neither of which erases anything
+        // currently on screen.
+        if matches!(mode, ansi::ClearMode::All) {
+            self.event_proxy.send_event(Event::ClearScreen);
+        }
+
         self.mark_fully_damaged();
     }
 

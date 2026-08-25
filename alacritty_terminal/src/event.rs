@@ -82,6 +82,21 @@ pub enum Event {
     /// field exists specifically so a consumer never needs to (and never
     /// should) re-derive the cursor position for an ApcString event itself.
     ApcString(Vec<u8>, Point),
+
+    /// The terminal just processed a real screen-erase escape sequence
+    /// (`ED`/Erase in Display, `CSI Ps J`) via `Handler::clear_screen` —
+    /// i.e. a real `clear`/`Clear-Host` invocation by whatever program
+    /// is running in the PTY, not merely the viewport scrolling so a
+    /// previously-drawn region is no longer visible. Added specifically
+    /// so a receiving application (Som) can distinguish "the screen was
+    /// actually wiped" from "content scrolled out of view but still
+    /// exists in scrollback" — the two look identical from a single
+    /// rendered frame alone, but need different handling for anything
+    /// with side effects tied to on-screen presence (e.g. Som stops any
+    /// audio still playing for a placement whose grid cells `clear` just
+    /// erased for good, but must NOT stop it just because the user
+    /// scrolled the placement off-screen).
+    ClearScreen,
 }
 
 impl Debug for Event {
@@ -103,6 +118,7 @@ impl Debug for Event {
             Event::ApcString(bytes, cursor) => {
                 write!(f, "ApcString({} bytes, cursor={cursor:?})", bytes.len())
             },
+            Event::ClearScreen => write!(f, "ClearScreen"),
         }
     }
 }
