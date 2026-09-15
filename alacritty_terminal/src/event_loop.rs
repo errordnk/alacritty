@@ -73,31 +73,6 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// callers (`EventLoop::new`'s signature is unchanged) don't need any
     /// changes.
     raw_byte_sink: Option<Box<dyn Write + Send>>,
-    /// A rolling window of the most recent bytes `pty_read` has actually
-    /// forwarded downstream, each tagged with when it was read — see
-    /// `pty_read`'s deduplication check for why this exists. NOT just "the
-    /// last chunk": a genuine ConPTY-duplicated repeat can arrive after one
-    /// or more UNRELATED chunks land in between (e.g. a `\r\n` for Enter,
-    /// then a `\x1b[?6c` Device Attributes reply the shell prints before
-    /// its OWN duplicated `\r\n` arrives) — comparing only against the
-    /// single immediately-previous chunk misses that entirely, since by
-    /// the time the repeat shows up, "the last chunk" has already moved on
-    /// to the unrelated bytes in between.
-    recent_output: VecDeque<(u8, Instant)>,
-    /// When this read loop's `spawn()` last toggled write interest and
-    /// called `self.pty.reregister` — i.e. the one specific moment the
-    /// ConPTY duplicate-read bug (`UnblockedReader::register`'s "the pipe
-    /// still has data" check re-triggering a synthetic readable event even
-    /// when nothing new arrived) can actually happen. The dedup check in
-    /// `pty_read` below is gated on this being recent, INSTEAD OF matching
-    /// on the bytes' shape alone — matching on shape (e.g. "this chunk is
-    /// just `\r\n`") is fundamentally unreliable, since a real duplicate
-    /// and an entirely ordinary blank output line landing in its own
-    /// `read()` right after another `\r\n`-terminated line can look
-    /// byte-for-byte identical; the ONLY thing that actually distinguishes
-    /// a real duplicate is that it only happens right after a write-
-    /// interest toggle. `None` until the first toggle.
-    last_write_interest_toggle: Option<Instant>,
     /// When set, collapses a `\r\r\n` (CR CR LF) run read off the PTY back
     /// to a single `\r\n` before parsing — see `pty_read`'s dedicated
     /// handling for the full writeup. Set via `EventLoop::collapse_cr_cr_lf`
@@ -140,8 +115,6 @@ where
             drain_on_exit,
             ref_test,
             raw_byte_sink: None,
-            recent_output: VecDeque::new(),
-            last_write_interest_toggle: None,
             collapse_cr_cr_lf: false,
             pending_trailing_cr: false,
         })
@@ -289,145 +262,35 @@ where
                 }),
             };
 
-            // Windows ConPTY reader workaround: `Pty::reregister` (called
-            // whenever write interest toggles, i.e. whenever a keystroke
-            // needs sending right after some output arrived) can
-            // re-trigger a synthetic "readable" event for the read side
-            // even when nothing new actually arrived, via
-            // `UnblockedReader::register`'s own "the pipe still has data"
-            // check. When that races with this loop not having fully
-            // drained the pipe yet, the SAME bytes get read here a second
-            // time — confirmed via direct byte-for-byte instrumentation
-            // downstream (Som's own terminal crate, github.com/errordnk/
-            // som) that a chunk this loop had already handed to `writer`/
-            // `raw_byte_sink`/`parser.advance` a moment earlier
-            // (single-digit milliseconds prior) sometimes arrives again,
-            // identical or as a repeated prefix fused onto genuinely new
-            // bytes. A `Pty::reregister` fix (not re-registering the read
-            // side on a write-only interest change) was attempted first
-            // but did not eliminate this in direct reproduction, so this
-            // dedup — applied once, here, before any of the three
-            // downstream consumers (ref-test writer, raw_byte_sink,
-            // parser) ever see the bytes — is the actual fix point.
-            // Unix's PTY reading has no equivalent synthetic-event path
-            // and has never reproduced this, but the check is cheap
-            // enough to leave unconditional rather than cfg-gating it.
-            //
-            // NOT just "compare against the single previous chunk": a
-            // genuine ConPTY-duplicated repeat can arrive after one or
-            // more UNRELATED chunks land in between (confirmed via direct
-            // byte-level instrumentation — a `\r\n` for Enter, then the
-            // shell's own `\x1b[?6c` Device Attributes reply, THEN the
-            // duplicated `\r\n`). Comparing only against "the last chunk"
-            // misses this, since by the time the repeat shows up, that
-            // slot has already moved on to the unrelated bytes in
-            // between. Instead, `recent_output` keeps a rolling window of
-            // every byte actually forwarded downstream recently, and the
-            // check below looks for `current` as a repeated SUFFIX of
-            // that whole window, not just of the one immediately prior
-            // write.
-            //
-            // ALSO gated on `last_write_interest_toggle` being recent (see
-            // its own doc comment) — matching on the bytes' shape alone
-            // used to be the only guard (requiring >= 2 matched bytes,
-            // since a real duplicate always carries a couple of trailing
-            // escape bytes beyond the bare `\r\n`), but that's fundamentally
-            // unreliable: a genuinely ordinary blank output line landing in
-            // its own `read()` right after another `\r\n`-terminated line
-            // is byte-for-byte indistinguishable from a real duplicate by
-            // shape alone — confirmed as a real false positive that ate
-            // the blank line between a MOTD's kernel banner and the rest
-            // of `/etc/motd`. The write-interest-toggle timing is the
-            // actual distinguishing fact: the bug this dedup exists for
-            // can ONLY happen right after a toggle (see the comment on
-            // `reregister` above), so gating on that recency instead of
-            // (or in addition to) the bytes' shape means ordinary output
-            // that isn't anywhere near a keystroke is never touched.
-            const DUPLICATE_READ_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
-            const MIN_DEDUP_MATCH: usize = 2;
-            // See the module-level `MAX_DEDUP_CHUNK` doc comment: `yazi`
-            // pushes megabytes of base64 the instant a keypress moves the
-            // selection, landing squarely inside the post-toggle window,
-            // and this matcher would otherwise happily mistake its long
-            // genuinely-repeating runs for a duplicated read and delete
-            // them — losing an arbitrary slice out of the middle of an APC
-            // string truncates the image transmission: the terminal then
-            // waits forever for a final chunk that already went by.
-            let now = Instant::now();
-            while self.recent_output.front().is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_READ_WINDOW) {
-                self.recent_output.pop_front();
-            }
-
-            // Gated on a RECENT write-interest toggle (see
-            // `last_write_interest_toggle`'s doc comment for why this is
-            // the correct condition, not matching on the bytes' shape).
-            // Deliberately checked fresh on every chunk within this same
-            // `pty_read` call (not hoisted out of the loop) — a toggle can
-            // happen between reads inside one call too, though in practice
-            // it's set once just before `pty_read` runs.
-            //
-            // ALSO gated on `cfg(windows)` — this whole dedup exists for a
-            // Windows ConPTY-specific synthetic-event bug (see `reregister`
-            // above); Unix's PTY reading has no equivalent path and has
-            // never reproduced it. Confirmed this matters in practice, not
-            // just in theory: an SSH tmux:true profile's HOLDER runs this
-            // SAME event loop on the Unix (Linux) side, reading the real
-            // shell's actual PTY directly — with the dedup active there
-            // too, its very first `pty_read` (the shell's MOTD, several
-            // back-to-back reads while the terminal lock briefly contended)
-            // ate the legitimate blank line between the kernel banner and
-            // the rest of `/etc/motd`, which a real `ssh` login never does.
-            #[cfg(windows)]
-            let recently_toggled = self
-                .last_write_interest_toggle
-                .is_some_and(|at| now.duration_since(at) < DUPLICATE_READ_WINDOW);
-            #[cfg(not(windows))]
-            let recently_toggled = false;
-
-            // See `MAX_DEDUP_CHUNK`: only keystroke-sized reads can be the
-            // duplicate this exists to catch, and running the matcher over
-            // bulk output actively corrupts it.
-            let recently_toggled = recently_toggled && unprocessed <= MAX_DEDUP_CHUNK;
-
-            let mut current = &buf[..unprocessed];
-            let recent: Vec<u8> = self.recent_output.iter().map(|(byte, _)| *byte).collect();
-            let deduped;
-            if recently_toggled
-                && current.len() >= MIN_DEDUP_MATCH
-                && recent.len() >= current.len()
-                && recent.ends_with(current)
-            {
-                // The whole chunk is an exact repeat of the tail of what
-                // was just forwarded — skip all three downstream
-                // consumers for it entirely.
-                processed += unprocessed;
-                unprocessed = 0;
-                if processed >= MAX_LOCKED_READ {
-                    break;
-                }
-                continue;
-            }
-            // Look for the longest prefix of `current` that repeats the
-            // tail of `recent_output` (longest first, so e.g. a 2-byte
-            // `\r\n` repeat is found even if a shorter accidental match
-            // exists at length 1) and strip just that much, forwarding
-            // whatever new bytes follow it. Same `recently_toggled` gate as
-            // the whole-chunk branch above applies here too.
-            let max_prefix = if recently_toggled { current.len().min(recent.len()) } else { 0 };
-            let mut matched_prefix_len = 0;
-            for len in (MIN_DEDUP_MATCH..=max_prefix).rev() {
-                if recent.ends_with(&current[..len]) {
-                    matched_prefix_len = len;
-                    break;
-                }
-            }
-            if matched_prefix_len > 0 {
-                deduped = current[matched_prefix_len..].to_vec();
-                current = &deduped;
-            }
-            for &byte in current {
-                self.recent_output.push_back((byte, now));
-            }
+            // A second, rolling-window dedup used to live here (comparing
+            // each fully-accumulated `buf[..unprocessed]` against a
+            // `recent_output` history of recently-forwarded bytes, gated
+            // on `last_write_interest_toggle` recency). Removed
+            // (2026-09-15): it matched on the bytes' SHAPE alone (does
+            // `current` look like a repeat of something recently sent),
+            // which is fundamentally unreliable — confirmed twice over via
+            // live reproduction. First as a false positive that ate the
+            // legitimate blank line between a MOTD's kernel banner and the
+            // rest of `/etc/motd` (any ordinary blank-line-after-`\r\n` is
+            // byte-for-byte indistinguishable from a real duplicate by
+            // shape alone). Then, after narrowing the check to require an
+            // exact whole-chunk match, it STILL falsely triggered during a
+            // fast held-backspace burst against a remote shell's line
+            // editor (which naturally repeats similar/identical short
+            // erase sequences across consecutive keystrokes) — silently
+            // dropping a genuine new chunk and leaving permanent leftover
+            // characters on a wrapped line's second visual row that no
+            // amount of further backspacing could ever clear. The
+            // in-buffer check above (comparing THIS READ against the bytes
+            // immediately preceding it in the SAME `buf`, within the SAME
+            // `pty_read` call) is a strictly narrower, structurally-
+            // grounded condition — it can only match the actual mechanism
+            // of the ConPTY duplicate-read bug (the same already-forwarded
+            // bytes getting handed back by a second `read()` in this same
+            // drain loop), not merely similar-looking-but-genuinely-new
+            // output arriving later. That check alone is kept; no
+            // replacement for this wider, history-based one was added.
+            let current = &buf[..unprocessed];
 
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
@@ -701,10 +564,10 @@ where
 
                     // Re-register with new interest — this is the exact
                     // moment that can spuriously re-trigger a readable
-                    // event for already-drained data (see
-                    // `last_write_interest_toggle`'s doc comment).
+                    // event for already-drained data (see the in-buffer
+                    // dedup check earlier in `pty_read`, which is what
+                    // actually catches that case).
                     self.pty.reregister(&self.poll, interest, poll_opts).unwrap();
-                    self.last_write_interest_toggle = Some(Instant::now());
                 }
             }
 
