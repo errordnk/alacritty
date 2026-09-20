@@ -6,9 +6,14 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::IntoRawHandle;
 use std::{mem, ptr};
 
-use windows_sys::Win32::Foundation::{HANDLE, S_OK};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, S_OK};
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::core::{HRESULT, PWSTR};
@@ -110,6 +115,22 @@ impl ConptyApi {
 pub struct Conpty {
     pub handle: HPCON,
     api: ConptyApi,
+    /// Windows Job Object this session's real child process (the shell,
+    /// and transitively everything IT spawns — `somsrp`, `ssh`, any
+    /// nested command) was assigned to at creation time, with
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set — closing the job's last
+    /// handle (here, in `Drop` below) tells Windows to terminate every
+    /// process still in it. Without this, Windows has no equivalent of
+    /// POSIX's process-group `SIGKILL` (`killpg`, already used on the
+    /// Unix side of this same lifecycle — see `pty_info.rs`'s
+    /// `kill_current_process`): a plain `TerminateProcess` on the shell
+    /// alone leaves any orphaned grandchild (a `somsrp` a user left
+    /// running inside a live full-terminal widget, mid-video, when the
+    /// whole terminal app closes) running forever with nothing left to
+    /// read its output. `None` if job creation/assignment failed for any
+    /// reason (best-effort — a PTY session still works without this, it
+    /// would just leak orphans on close the same way it always has).
+    job_handle: Option<HANDLE>,
 }
 
 impl Drop for Conpty {
@@ -119,6 +140,17 @@ impl Drop for Conpty {
         //
         // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
         unsafe { (self.api.close)(self.handle) }
+        // Closing the job handle AFTER the pseudoconsole — order doesn't
+        // matter for correctness (the job's kill-on-close only touches
+        // the real Win32 process tree, entirely separate from the
+        // ConPTY's own pipe/console-buffer teardown above), kept this way
+        // simply to mirror this function's existing pseudoconsole-first
+        // structure.
+        if let Some(job_handle) = self.job_handle.take() {
+            unsafe {
+                CloseHandle(job_handle);
+            }
+        }
     }
 }
 
@@ -264,13 +296,63 @@ pub fn new(config: &Options, window_size: WindowSize) -> Result<Pty> {
         }
     }
 
+    // Best-effort — a failure here (job creation, or a process already
+    // being part of another job that itself forbids nesting on older
+    // Windows versions predating job nesting support) still leaves a
+    // perfectly working PTY session, just without the "close kills the
+    // whole tree" guarantee this job exists to provide. See `Conpty::
+    // job_handle`'s own doc comment for why this matters at all.
+    let job_handle = create_kill_on_close_job_and_assign(proc_info.hProcess);
+
     let conin = UnblockedWriter::new(conin, PIPE_CAPACITY);
     let conout = UnblockedReader::new(conout, CONOUT_READER_BUFFER_CAPACITY);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess)?;
-    let conpty = Conpty { handle: pty_handle as HPCON, api };
+    let conpty = Conpty { handle: pty_handle as HPCON, api, job_handle };
 
     Ok(Pty::new(conpty, conout, conin, child_watcher))
+}
+
+/// Creates an unnamed Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_
+/// JOB_CLOSE` and assigns `process_handle` (the shell this PTY session
+/// just spawned) to it. Returns `None` on any failure — see this
+/// function's own call site for why that's an acceptable degraded mode,
+/// not treated as a hard error for the whole PTY creation.
+///
+/// Assigning only the immediate child (the shell) is sufficient to catch
+/// its whole subtree: Windows child processes inherit their parent's job
+/// membership by default (unless a child is itself created with
+/// `CREATE_BREAKAWAY_FROM_JOB`, which nothing in this codebase's own
+/// spawn paths — `somsrp`, `ssh`, etc. — ever requests), so `somsrp` (or
+/// any other program a user runs inside this shell) ends up in the SAME
+/// job transitively, with no per-grandchild bookkeeping needed here.
+fn create_kill_on_close_job_and_assign(process_handle: HANDLE) -> Option<HANDLE> {
+    unsafe {
+        let job_handle = CreateJobObjectW(ptr::null(), ptr::null());
+        if job_handle.is_null() {
+            return None;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set_ok = SetInformationJobObject(
+            job_handle,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if set_ok == 0 {
+            CloseHandle(job_handle);
+            return None;
+        }
+
+        if AssignProcessToJobObject(job_handle, process_handle) == 0 {
+            CloseHandle(job_handle);
+            return None;
+        }
+
+        Some(job_handle)
+    }
 }
 
 // Windows environment variables are case-insensitive, and the caller is responsible for
