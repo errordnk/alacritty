@@ -38,6 +38,20 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 /// then waits forever for a final chunk that already went by.
 const MAX_DEDUP_CHUNK: usize = 256;
 
+/// A filter over the byte stream read off the PTY, run after the ConPTY
+/// duplicate-read workaround and the `\r\r\n` collapse and before the bytes
+/// reach the parser.
+///
+/// For callers that carry their own messages inside the PTY stream (Som's
+/// `somsrv` relay multiplexes its rich-content channel into the output of the
+/// tab's remote pty): the filter takes those messages out and pushes the rest,
+/// unchanged and in order, onto `out`. A filter may hold back a trailing part
+/// of `input` that could be the start of one of its messages, and push it
+/// with the next call.
+pub trait StreamFilter: Send {
+    fn filter(&mut self, input: &[u8], out: &mut Vec<u8>);
+}
+
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
 pub enum Msg {
@@ -88,6 +102,9 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     /// `\r\r\n` split across two reads (e.g. `...\r` then `\r\n...`) is still
     /// collapsed — only meaningful when `collapse_cr_cr_lf` is set.
     pending_trailing_cr: bool,
+    /// See [`StreamFilter`]. `None` by default; set via
+    /// `EventLoop::with_stream_filter`.
+    stream_filter: Option<Box<dyn StreamFilter>>,
 }
 
 impl<T, U> EventLoop<T, U>
@@ -117,7 +134,15 @@ where
             raw_byte_sink: None,
             collapse_cr_cr_lf: false,
             pending_trailing_cr: false,
+            stream_filter: None,
         })
+    }
+
+    /// Runs `filter` over everything read off the PTY before it is parsed -
+    /// see [`StreamFilter`]. Must be called before `spawn()`.
+    pub fn with_stream_filter(mut self, filter: Box<dyn StreamFilter>) -> Self {
+        self.stream_filter = Some(filter);
+        self
     }
 
     /// Registers `sink` to receive a copy of every raw byte this event
@@ -325,6 +350,18 @@ where
                 &collapsed[..]
             } else {
                 current
+            };
+
+            // Take out whatever the caller carries inside the stream.
+            let filtered;
+            let current = match &mut self.stream_filter {
+                Some(filter) => {
+                    let mut out = Vec::with_capacity(current.len());
+                    filter.filter(current, &mut out);
+                    filtered = out;
+                    &filtered[..]
+                },
+                None => current,
             };
 
             // Parse the incoming bytes.
