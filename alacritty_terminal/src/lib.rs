@@ -14,6 +14,7 @@ pub mod term;
 pub mod thread;
 pub mod tty;
 pub mod vi_mode;
+pub mod vt_ops;
 
 pub use crate::grid::Grid;
 pub use crate::term::Term;
