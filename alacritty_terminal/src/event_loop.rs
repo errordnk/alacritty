@@ -632,23 +632,20 @@ where
 /// bare `\n` all pass through untouched, so ordinary output (including
 /// genuine blank lines, which are `\r\n\r\n`, never `\r\r\n`) is never
 /// altered.
-fn collapse_cr_cr_lf(chunk: &[u8], _pending_trailing_cr: &mut bool) -> Vec<u8> {
+fn collapse_cr_cr_lf(chunk: &[u8], after_crlf: &mut bool) -> Vec<u8> {
+    // `after_crlf`: the stream so far (this chunk or the previous one) ends in
+    // `\r\n`. Only then is a `\r\r\n` the duplicate; on its own it is a real
+    // newline (a shell's `\r\n` through the pty's `\n` -> `\r\n`) and is kept.
     let mut out = Vec::with_capacity(chunk.len());
     let mut i = 0;
     while i < chunk.len() {
-        // Match an exact `\r\r\n` run and drop it entirely — it's the
-        // ConPTY's duplicate of the `\r\n` that (in the normal case)
-        // immediately precedes it in the stream.
-        if chunk[i] == b'\r'
-            && i + 2 < chunk.len()
-            && chunk[i + 1] == b'\r'
-            && chunk[i + 2] == b'\n'
-        {
+        if *after_crlf && chunk[i..].starts_with(b"\r\r\n") {
             i += 3;
             continue;
         }
         out.push(chunk[i]);
         i += 1;
+        *after_crlf = out.ends_with(b"\r\n") || (*after_crlf && out.is_empty());
     }
     out
 }
@@ -848,6 +845,19 @@ mod collapse_cr_cr_lf_tests {
         assert_eq!(collapse_cr_cr_lf(b"\r", &mut pending), b"\r");
         assert_eq!(collapse_cr_cr_lf(b"\n", &mut pending), b"\n");
         assert_eq!(collapse_cr_cr_lf(b"a\rb", &mut pending), b"a\rb");
+    }
+
+    #[test]
+    fn keeps_a_lone_cr_cr_lf_it_is_a_real_newline() {
+        let mut pending = false;
+        assert_eq!(collapse_cr_cr_lf(b"curl x\r\r\nprompt", &mut pending), b"curl x\r\r\nprompt");
+    }
+
+    #[test]
+    fn drops_the_duplicate_split_across_chunks() {
+        let mut pending = false;
+        assert_eq!(collapse_cr_cr_lf(b"a\r\n", &mut pending), b"a\r\n");
+        assert_eq!(collapse_cr_cr_lf(b"\r\r\nb", &mut pending), b"b");
     }
 
     #[test]
