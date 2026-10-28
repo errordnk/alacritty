@@ -11,7 +11,8 @@ use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
@@ -334,7 +335,11 @@ fn create_kill_on_close_job_and_assign(process_handle: HANDLE) -> Option<HANDLE>
         }
 
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // BREAKAWAY_OK lets a process that asks for it (`CREATE_BREAKAWAY_FROM_JOB`)
+        // leave the job: a daemon meant to outlive the terminal (somsrv) does.
+        // Everything else still dies with the job.
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         let set_ok = SetInformationJobObject(
             job_handle,
             JobObjectExtendedLimitInformation,
